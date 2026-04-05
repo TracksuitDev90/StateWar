@@ -5,6 +5,8 @@ import { GameStateManager } from "../state/GameStateManager";
 import { LogicTick } from "../state/LogicTick";
 import { Owner, CombatResult } from "../types";
 
+const DPR = Math.min(window.devicePixelRatio || 1, 2);
+
 // Owner-based colors
 const OWNER_COLORS: Record<Owner, number> = {
   player: 0x3b82f6,
@@ -15,8 +17,8 @@ const OWNER_COLORS: Record<Owner, number> = {
 const SELECTED_BORDER = 0xfbbf24;
 const VALID_TARGET_BORDER = 0x22d3ee;
 const BORDER_COLOR = 0x1f2937;
-const BORDER_WIDTH = 1.5;
-const SELECTED_BORDER_WIDTH = 3;
+const BORDER_WIDTH = 1.5 * DPR;
+const SELECTED_BORDER_WIDTH = 3 * DPR;
 
 interface StateVisual {
   data: StateData;
@@ -24,6 +26,11 @@ interface StateVisual {
   label: Phaser.GameObjects.Text;
   unitText: Phaser.GameObjects.Text;
   centroid: [number, number];
+}
+
+// Scale polygon coordinates by DPR
+function scaledPolygon(polygon: [number, number][]): [number, number][] {
+  return polygon.map(([x, y]) => [x * DPR, y * DPR]);
 }
 
 export class MapScene extends Phaser.Scene {
@@ -45,14 +52,17 @@ export class MapScene extends Phaser.Scene {
     // Build visuals for each state
     for (const state of stateData) {
       const centroid = this.computeCentroid(state.polygons[0]);
+      const cx = centroid[0] * DPR;
+      const cy = centroid[1] * DPR;
       const gfxList: Phaser.GameObjects.Graphics[] = [];
 
       for (const polygon of state.polygons) {
         if (polygon.length < 3) continue;
 
         const gfx = this.add.graphics();
+        const scaled = scaledPolygon(polygon);
         const flatPoints: number[] = [];
-        for (const [x, y] of polygon) flatPoints.push(x, y);
+        for (const [x, y] of scaled) flatPoints.push(x, y);
         const hitArea = new Phaser.Geom.Polygon(flatPoints);
 
         gfx.setInteractive(hitArea, Phaser.Geom.Polygon.Contains);
@@ -63,38 +73,39 @@ export class MapScene extends Phaser.Scene {
         gfxList.push(gfx);
       }
 
-      const label = this.add.text(centroid[0], centroid[1] - 8, state.id, {
-        fontSize: "9px",
+      const label = this.add.text(cx, cy - 10 * DPR, state.id, {
+        fontSize: `${Math.round(12 * DPR)}px`,
         color: "#ffffff",
-        fontFamily: "monospace",
-        stroke: "#000000",
-        strokeThickness: 2,
-      }).setOrigin(0.5).setDepth(1);
-
-      const unitText = this.add.text(centroid[0], centroid[1] + 6, "", {
-        fontSize: "11px",
-        color: "#ffffff",
-        fontFamily: "monospace",
+        fontFamily: "'Segoe UI', Arial, sans-serif",
         fontStyle: "bold",
         stroke: "#000000",
-        strokeThickness: 3,
+        strokeThickness: 3 * DPR,
+      }).setOrigin(0.5).setDepth(1);
+
+      const unitText = this.add.text(cx, cy + 8 * DPR, "", {
+        fontSize: `${Math.round(14 * DPR)}px`,
+        color: "#ffffff",
+        fontFamily: "'Segoe UI', Arial, sans-serif",
+        fontStyle: "bold",
+        stroke: "#000000",
+        strokeThickness: 4 * DPR,
       }).setOrigin(0.5).setDepth(1);
 
       this.visuals.set(state.id, { data: state, gfxList, label, unitText, centroid });
     }
 
     // Info bar
-    this.infoText = this.add.text(640, 12, "Select one of your states (blue)", {
-      fontSize: "18px",
+    this.infoText = this.add.text(640 * DPR, 14 * DPR, "Select one of your states (blue)", {
+      fontSize: `${Math.round(18 * DPR)}px`,
       color: "#ffffff",
-      fontFamily: "monospace",
+      fontFamily: "'Segoe UI', Arial, sans-serif",
     }).setOrigin(0.5, 0).setDepth(2);
 
     // Stats display (bottom-right)
-    this.statsText = this.add.text(1270, 708, "", {
-      fontSize: "13px",
+    this.statsText = this.add.text(1270 * DPR, 708 * DPR, "", {
+      fontSize: `${Math.round(14 * DPR)}px`,
       color: "#d1d5db",
-      fontFamily: "monospace",
+      fontFamily: "'Segoe UI', Arial, sans-serif",
       align: "right",
     }).setOrigin(1, 1).setDepth(2);
 
@@ -142,12 +153,12 @@ export class MapScene extends Phaser.Scene {
       borderWidth = SELECTED_BORDER_WIDTH;
     } else if (isValidTarget) {
       borderColor = VALID_TARGET_BORDER;
-      borderWidth = 2.5;
+      borderWidth = 2.5 * DPR;
     }
 
     for (let i = 0; i < vis.gfxList.length; i++) {
       const polygon = vis.data.polygons[i];
-      if (polygon) this.drawPoly(vis.gfxList[i], polygon, fillColor, borderColor, borderWidth);
+      if (polygon) this.drawPoly(vis.gfxList[i], scaledPolygon(polygon), fillColor, borderColor, borderWidth);
     }
 
     vis.unitText.setText(String(units));
@@ -194,38 +205,33 @@ export class MapScene extends Phaser.Scene {
   }
 
   private onClickState(stateId: string): void {
-    // If nothing selected, try to select a player state
     if (this.selectedStateId === null) {
       if (this.gsm.getOwner(stateId) === "player") {
         this.selectedStateId = stateId;
         this.redrawAll();
         const vis = this.visuals.get(stateId)!;
         const units = this.gsm.getUnits(stateId);
-        this.infoText.setText(`${vis.data.name} selected (${units} units) — click adjacent state to move`);
+        this.infoText.setText(`${vis.data.name} selected (${units} units) — tap adjacent state`);
       }
       return;
     }
 
-    // If clicking the already-selected state, deselect
     if (stateId === this.selectedStateId) {
       this.deselect();
       return;
     }
 
-    // If clicking a valid target, move units
     if (this.isValidTarget(stateId)) {
       this.executeMove(stateId);
       return;
     }
 
-    // If clicking another player state, switch selection
     if (this.gsm.getOwner(stateId) === "player") {
       this.selectedStateId = stateId;
       this.redrawAll();
       return;
     }
 
-    // Otherwise deselect
     this.deselect();
   }
 
@@ -239,7 +245,7 @@ export class MapScene extends Phaser.Scene {
     const fromId = this.selectedStateId!;
     const fromOwner = this.gsm.getOwner(fromId);
     const toOwner = this.gsm.getOwner(targetId);
-    const attackers = this.gsm.getUnits(fromId) - 1; // leave 1 behind
+    const attackers = this.gsm.getUnits(fromId) - 1;
 
     if (attackers < 1) {
       this.infoText.setText("Not enough units to move!");
@@ -250,11 +256,9 @@ export class MapScene extends Phaser.Scene {
     const targetVis = this.visuals.get(targetId)!;
 
     if (fromOwner === toOwner) {
-      // Friendly move
       this.gsm.moveUnits(fromId, targetId, attackers);
       this.infoText.setText(`Moved ${attackers} units to ${targetVis.data.name}`);
     } else {
-      // Combat
       const result: CombatResult = this.gsm.resolveCombat(fromId, targetId, attackers);
       if (result.captured) {
         this.infoText.setText(
@@ -281,7 +285,7 @@ export class MapScene extends Phaser.Scene {
   private updateInfoDefault(): void {
     if (this.selectedStateId) {
       const vis = this.visuals.get(this.selectedStateId)!;
-      this.infoText.setText(`${vis.data.name} selected — click adjacent state to move`);
+      this.infoText.setText(`${vis.data.name} selected — tap adjacent state`);
     } else {
       this.infoText.setText("Select one of your states (blue)");
     }
@@ -293,7 +297,7 @@ export class MapScene extends Phaser.Scene {
     const aStates = this.logicTick.countStates("ai");
     const aUnits = this.logicTick.countUnits("ai");
     this.statsText.setText(
-      `Player: ${pStates} states, ${pUnits} units  |  AI: ${aStates} states, ${aUnits} units`
+      `You: ${pStates} states, ${pUnits} units  |  AI: ${aStates} states, ${aUnits} units`
     );
   }
 

@@ -1,10 +1,12 @@
 import Phaser from "phaser";
 import { MapScene } from "./scenes/MapScene";
 
+const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
 const config: Phaser.Types.Core.GameConfig = {
   type: Phaser.AUTO,
-  width: 1280,
-  height: 720,
+  width: 1280 * dpr,
+  height: 720 * dpr,
   backgroundColor: "#1a1a2e",
   parent: document.body,
   scene: [MapScene],
@@ -17,6 +19,11 @@ const config: Phaser.Types.Core.GameConfig = {
     touch: {
       capture: true,
     },
+  },
+  render: {
+    antialias: true,
+    antialiasGL: true,
+    roundPixels: false,
   },
 };
 
