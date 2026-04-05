@@ -1,6 +1,8 @@
 import Phaser from "phaser";
 import { stateData, StateData } from "../data/states";
+import { stateBonuses } from "../data/stateBonuses";
 import { GameStateManager } from "../state/GameStateManager";
+import { LogicTick } from "../state/LogicTick";
 import { Owner, CombatResult } from "../types";
 
 // Owner-based colors
@@ -27,8 +29,10 @@ interface StateVisual {
 export class MapScene extends Phaser.Scene {
   private visuals: Map<string, StateVisual> = new Map();
   private gsm!: GameStateManager;
+  private logicTick!: LogicTick;
   private selectedStateId: string | null = null;
   private infoText!: Phaser.GameObjects.Text;
+  private statsText!: Phaser.GameObjects.Text;
 
   constructor() {
     super({ key: "MapScene" });
@@ -86,13 +90,29 @@ export class MapScene extends Phaser.Scene {
       fontFamily: "monospace",
     }).setOrigin(0.5, 0).setDepth(2);
 
+    // Stats display (bottom-right)
+    this.statsText = this.add.text(1270, 708, "", {
+      fontSize: "13px",
+      color: "#d1d5db",
+      fontFamily: "monospace",
+      align: "right",
+    }).setOrigin(1, 1).setDepth(2);
+
     // Right-click or Escape to deselect
     this.input.on("pointerdown", (pointer: Phaser.Input.Pointer) => {
       if (pointer.rightButtonDown()) this.deselect();
     });
     this.input.keyboard!.on("keydown-ESC", () => this.deselect());
 
+    // Start logic tick (1000ms interval, separate from 60fps render)
+    this.logicTick = new LogicTick(this.gsm, () => {
+      this.redrawAll();
+      this.updateStats();
+    });
+    this.logicTick.start();
+
     this.redrawAll();
+    this.updateStats();
   }
 
   // ── Rendering ──
@@ -161,7 +181,11 @@ export class MapScene extends Phaser.Scene {
       const units = this.gsm.getUnits(stateId);
       const def = this.gsm.getDefenseBonus(stateId);
       const defStr = def !== 1.0 ? ` | def ×${def}` : "";
-      this.infoText.setText(`${vis.data.name} | ${owner} | ${units} units${defStr}`);
+      const genRate = this.logicTick.getGenRate(stateId);
+      const genStr = genRate > 0 ? ` | +${genRate.toFixed(1)}/s` : "";
+      const bonus = stateBonuses[stateId];
+      const bonusStr = bonus ? ` | ${bonus.description}` : "";
+      this.infoText.setText(`${vis.data.name} | ${owner} | ${units} units${defStr}${genStr}${bonusStr}`);
     } else {
       this.updateInfoDefault();
     }
@@ -259,6 +283,20 @@ export class MapScene extends Phaser.Scene {
     } else {
       this.infoText.setText("Select one of your states (blue)");
     }
+  }
+
+  private updateStats(): void {
+    const pStates = this.logicTick.countStates("player");
+    const pUnits = this.logicTick.countUnits("player");
+    const aStates = this.logicTick.countStates("ai");
+    const aUnits = this.logicTick.countUnits("ai");
+    this.statsText.setText(
+      `Player: ${pStates} states, ${pUnits} units  |  AI: ${aStates} states, ${aUnits} units`
+    );
+  }
+
+  shutdown(): void {
+    this.logicTick.stop();
   }
 
   // ── Utilities ──
