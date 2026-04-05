@@ -4,7 +4,7 @@ import { Owner } from "../types";
 import { stateBonuses } from "../data/stateBonuses";
 
 const TICK_INTERVAL_MS = 1000;
-const BASE_GEN_PER_STATE = 0.3;
+const BASE_GEN_PER_STATE = 0.15;
 const GEN_CAP = 99;
 const AI_TICK_INTERVAL = 3; // AI acts every 3 ticks (3 seconds)
 
