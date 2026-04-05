@@ -102,7 +102,9 @@ export class MapScene extends Phaser.Scene {
     this.input.on("pointerdown", (pointer: Phaser.Input.Pointer) => {
       if (pointer.rightButtonDown()) this.deselect();
     });
-    this.input.keyboard!.on("keydown-ESC", () => this.deselect());
+    if (this.input.keyboard) {
+      this.input.keyboard.on("keydown-ESC", () => this.deselect());
+    }
 
     // Start logic tick (1000ms interval, separate from 60fps render)
     this.logicTick = new LogicTick(this.gsm, () => {
