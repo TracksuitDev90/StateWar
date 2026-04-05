@@ -1,8 +1,7 @@
 import Phaser from "phaser";
 import { stateData, StateData } from "../data/states";
-import { adjacencyGraph } from "../data/adjacency";
 import { GameStateManager } from "../state/GameStateManager";
-import { Owner } from "../types";
+import { Owner, CombatResult } from "../types";
 
 // Owner-based colors
 const OWNER_COLORS: Record<Owner, number> = {
@@ -160,8 +159,9 @@ export class MapScene extends Phaser.Scene {
     if (hovering) {
       const owner = this.gsm.getOwner(stateId);
       const units = this.gsm.getUnits(stateId);
-      const neighbors = adjacencyGraph[stateId]?.length ?? 0;
-      this.infoText.setText(`${vis.data.name} | ${owner} | ${units} units | ${neighbors} borders`);
+      const def = this.gsm.getDefenseBonus(stateId);
+      const defStr = def !== 1.0 ? ` | def ×${def}` : "";
+      this.infoText.setText(`${vis.data.name} | ${owner} | ${units} units${defStr}`);
     } else {
       this.updateInfoDefault();
     }
@@ -205,47 +205,39 @@ export class MapScene extends Phaser.Scene {
 
   private isValidTarget(targetId: string): boolean {
     if (!this.selectedStateId) return false;
-    const neighbors = adjacencyGraph[this.selectedStateId] ?? [];
-    if (!neighbors.includes(targetId)) return false;
-    // Valid target: same-owner friendly move, or enemy/neutral for future combat
-    return true;
+    return this.gsm.canMove(this.selectedStateId, targetId)
+      || this.gsm.canAttack(this.selectedStateId, targetId);
   }
 
   private executeMove(targetId: string): void {
     const fromId = this.selectedStateId!;
-    const fromState = this.gsm.state[fromId];
-    const toState = this.gsm.state[targetId];
+    const fromOwner = this.gsm.getOwner(fromId);
+    const toOwner = this.gsm.getOwner(targetId);
+    const attackers = this.gsm.getUnits(fromId) - 1; // leave 1 behind
 
-    // Move all but 1 unit
-    const moveCount = fromState.units - 1;
-    if (moveCount < 1) {
+    if (attackers < 1) {
       this.infoText.setText("Not enough units to move!");
       this.deselect();
       return;
     }
 
-    if (toState.owner === fromState.owner) {
+    const targetVis = this.visuals.get(targetId)!;
+
+    if (fromOwner === toOwner) {
       // Friendly move
-      this.gsm.moveUnits(fromId, targetId, moveCount);
-      const vis = this.visuals.get(targetId)!;
-      this.infoText.setText(`Moved ${moveCount} units to ${vis.data.name}`);
+      this.gsm.moveUnits(fromId, targetId, attackers);
+      this.infoText.setText(`Moved ${attackers} units to ${targetVis.data.name}`);
     } else {
-      // Enemy/neutral — for now, just transfer if overwhelming (combat comes in step 5)
-      // Placeholder: simple capture if attacker > defender
-      if (moveCount > toState.units) {
-        fromState.units -= moveCount;
-        toState.units = moveCount - toState.units;
-        toState.owner = fromState.owner;
-        const vis = this.visuals.get(targetId)!;
-        this.infoText.setText(`Captured ${vis.data.name}!`);
+      // Combat
+      const result: CombatResult = this.gsm.resolveCombat(fromId, targetId, attackers);
+      if (result.captured) {
+        this.infoText.setText(
+          `Captured ${targetVis.data.name}! Lost ${result.attackerLost}, killed ${result.defenderLost}`
+        );
       } else {
-        // Failed attack — lose units equal to defender
-        fromState.units -= moveCount;
-        toState.units -= moveCount;
-        if (toState.units <= 0) {
-          toState.units = 1;
-        }
-        this.infoText.setText("Attack failed — not enough units!");
+        this.infoText.setText(
+          `Attack on ${targetVis.data.name} failed! Lost ${result.attackerLost}, killed ${result.defenderLost}`
+        );
       }
     }
 
