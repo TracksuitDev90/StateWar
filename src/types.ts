@@ -6,3 +6,11 @@ export interface TerritoryState {
 }
 
 export type GameState = Record<string, TerritoryState>;
+
+export interface CombatResult {
+  attackerLost: number;
+  defenderLost: number;
+  captured: boolean;
+  remainingAttackers: number;
+  remainingDefenders: number;
+}
