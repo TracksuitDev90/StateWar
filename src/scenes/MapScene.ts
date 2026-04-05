@@ -1,27 +1,34 @@
 import Phaser from "phaser";
 import { stateData, StateData } from "../data/states";
+import { adjacencyGraph } from "../data/adjacency";
+import { GameStateManager } from "../state/GameStateManager";
+import { Owner } from "../types";
 
-// Color palette for states — enough variety to distinguish neighbors
-const STATE_COLORS: number[] = [
-  0x4a90d9, 0x50b86c, 0xd4a843, 0xc75050, 0x8b5fc7,
-  0x4ecdc4, 0xf7a55d, 0x6a8d73, 0xd4738a, 0x7a9cc6,
-  0xb8a960, 0x5f9ea0, 0xe8726a, 0x9b8ec4, 0x48b09e,
-  0xd4945a, 0x7fb069, 0xca7eb8, 0x6b9dc7, 0xaab85f,
-  0xd98a8a, 0x56a08c, 0xc4a254, 0x7d8cc4, 0xe0956e,
-];
+// Owner-based colors
+const OWNER_COLORS: Record<Owner, number> = {
+  player: 0x3b82f6,
+  ai: 0xef4444,
+  neutral: 0x6b7280,
+};
 
-const HOVER_TINT = 0.3;
-const BORDER_COLOR = 0x222222;
+const SELECTED_BORDER = 0xfbbf24;
+const VALID_TARGET_BORDER = 0x22d3ee;
+const BORDER_COLOR = 0x1f2937;
 const BORDER_WIDTH = 1.5;
+const SELECTED_BORDER_WIDTH = 3;
 
-interface StateGraphic {
+interface StateVisual {
   data: StateData;
-  fills: Phaser.GameObjects.Graphics[];
-  baseColor: number;
+  gfxList: Phaser.GameObjects.Graphics[];
+  label: Phaser.GameObjects.Text;
+  unitText: Phaser.GameObjects.Text;
+  centroid: [number, number];
 }
 
 export class MapScene extends Phaser.Scene {
-  private stateGraphics: StateGraphic[] = [];
+  private visuals: Map<string, StateVisual> = new Map();
+  private gsm!: GameStateManager;
+  private selectedStateId: string | null = null;
   private infoText!: Phaser.GameObjects.Text;
 
   constructor() {
@@ -29,111 +36,244 @@ export class MapScene extends Phaser.Scene {
   }
 
   create(): void {
-    this.cameras.main.setBackgroundColor(0x1a1a2e);
+    this.cameras.main.setBackgroundColor(0x111827);
+    this.gsm = new GameStateManager();
 
-    // Draw each state
-    for (let i = 0; i < stateData.length; i++) {
-      const state = stateData[i];
-      const color = STATE_COLORS[i % STATE_COLORS.length];
-      const fills: Phaser.GameObjects.Graphics[] = [];
+    // Build visuals for each state
+    for (const state of stateData) {
+      const centroid = this.computeCentroid(state.polygons[0]);
+      const gfxList: Phaser.GameObjects.Graphics[] = [];
 
       for (const polygon of state.polygons) {
         if (polygon.length < 3) continue;
 
         const gfx = this.add.graphics();
-        this.drawStatePoly(gfx, polygon, color, BORDER_COLOR, BORDER_WIDTH);
-
-        // Make interactive using a hit area polygon
         const flatPoints: number[] = [];
-        for (const [x, y] of polygon) {
-          flatPoints.push(x, y);
-        }
+        for (const [x, y] of polygon) flatPoints.push(x, y);
         const hitArea = new Phaser.Geom.Polygon(flatPoints);
 
         gfx.setInteractive(hitArea, Phaser.Geom.Polygon.Contains);
-        gfx.setData("stateId", state.id);
+        gfx.on("pointerover", () => this.onHover(state.id, true));
+        gfx.on("pointerout", () => this.onHover(state.id, false));
+        gfx.on("pointerdown", () => this.onClickState(state.id));
 
-        gfx.on("pointerover", () => this.onStateHover(state, color, true));
-        gfx.on("pointerout", () => this.onStateHover(state, color, false));
-        gfx.on("pointerdown", () => this.onStateClick(state));
-
-        fills.push(gfx);
+        gfxList.push(gfx);
       }
 
-      this.stateGraphics.push({ data: state, fills, baseColor: color });
-    }
-
-    // Draw state labels (abbreviations) at centroids
-    for (const sg of this.stateGraphics) {
-      const centroid = this.computeCentroid(sg.data.polygons[0]);
-      this.add.text(centroid[0], centroid[1], sg.data.id, {
+      const label = this.add.text(centroid[0], centroid[1] - 8, state.id, {
         fontSize: "9px",
         color: "#ffffff",
         fontFamily: "monospace",
         stroke: "#000000",
         strokeThickness: 2,
-      }).setOrigin(0.5);
+      }).setOrigin(0.5).setDepth(1);
+
+      const unitText = this.add.text(centroid[0], centroid[1] + 6, "", {
+        fontSize: "11px",
+        color: "#ffffff",
+        fontFamily: "monospace",
+        fontStyle: "bold",
+        stroke: "#000000",
+        strokeThickness: 3,
+      }).setOrigin(0.5).setDepth(1);
+
+      this.visuals.set(state.id, { data: state, gfxList, label, unitText, centroid });
     }
 
-    // Info text at top
-    this.infoText = this.add.text(640, 16, "Click a state", {
-      fontSize: "20px",
+    // Info bar
+    this.infoText = this.add.text(640, 12, "Select one of your states (blue)", {
+      fontSize: "18px",
       color: "#ffffff",
       fontFamily: "monospace",
-    }).setOrigin(0.5, 0);
+    }).setOrigin(0.5, 0).setDepth(2);
+
+    // Right-click or Escape to deselect
+    this.input.on("pointerdown", (pointer: Phaser.Input.Pointer) => {
+      if (pointer.rightButtonDown()) this.deselect();
+    });
+    this.input.keyboard!.on("keydown-ESC", () => this.deselect());
+
+    this.redrawAll();
   }
 
-  private drawStatePoly(
+  // ── Rendering ──
+
+  private redrawAll(): void {
+    for (const [id, vis] of this.visuals) {
+      this.redrawState(id, vis);
+    }
+  }
+
+  private redrawState(id: string, vis: StateVisual, hovered = false): void {
+    const owner = this.gsm.getOwner(id);
+    const units = this.gsm.getUnits(id);
+    const isSelected = this.selectedStateId === id;
+    const isValidTarget = this.selectedStateId !== null && this.isValidTarget(id);
+
+    let fillColor = OWNER_COLORS[owner];
+    if (hovered) fillColor = this.lightenColor(fillColor, 0.2);
+
+    let borderColor = BORDER_COLOR;
+    let borderWidth = BORDER_WIDTH;
+
+    if (isSelected) {
+      borderColor = SELECTED_BORDER;
+      borderWidth = SELECTED_BORDER_WIDTH;
+    } else if (isValidTarget) {
+      borderColor = VALID_TARGET_BORDER;
+      borderWidth = 2.5;
+    }
+
+    for (let i = 0; i < vis.gfxList.length; i++) {
+      const polygon = vis.data.polygons[i];
+      if (polygon) this.drawPoly(vis.gfxList[i], polygon, fillColor, borderColor, borderWidth);
+    }
+
+    vis.unitText.setText(String(units));
+  }
+
+  private drawPoly(
     gfx: Phaser.GameObjects.Graphics,
     polygon: [number, number][],
-    fillColor: number,
-    strokeColor: number,
-    strokeWidth: number
+    fill: number,
+    stroke: number,
+    strokeW: number,
   ): void {
     gfx.clear();
-    gfx.fillStyle(fillColor, 1);
-    gfx.lineStyle(strokeWidth, strokeColor, 1);
-
+    gfx.fillStyle(fill, 1);
+    gfx.lineStyle(strokeW, stroke, 1);
     gfx.beginPath();
     gfx.moveTo(polygon[0][0], polygon[0][1]);
-    for (let i = 1; i < polygon.length; i++) {
-      gfx.lineTo(polygon[i][0], polygon[i][1]);
-    }
+    for (let i = 1; i < polygon.length; i++) gfx.lineTo(polygon[i][0], polygon[i][1]);
     gfx.closePath();
     gfx.fillPath();
     gfx.strokePath();
   }
 
-  private onStateHover(state: StateData, baseColor: number, hovering: boolean): void {
-    const sg = this.stateGraphics.find(s => s.data.id === state.id);
-    if (!sg) return;
+  // ── Interaction ──
 
-    const color = hovering ? this.lightenColor(baseColor, HOVER_TINT) : baseColor;
+  private onHover(stateId: string, hovering: boolean): void {
+    const vis = this.visuals.get(stateId);
+    if (!vis) return;
+    this.redrawState(stateId, vis, hovering);
 
-    for (let i = 0; i < sg.fills.length; i++) {
-      const polygon = state.polygons[i];
-      if (polygon) {
-        this.drawStatePoly(sg.fills[i], polygon, color, BORDER_COLOR, BORDER_WIDTH);
+    if (hovering) {
+      const owner = this.gsm.getOwner(stateId);
+      const units = this.gsm.getUnits(stateId);
+      const neighbors = adjacencyGraph[stateId]?.length ?? 0;
+      this.infoText.setText(`${vis.data.name} | ${owner} | ${units} units | ${neighbors} borders`);
+    } else {
+      this.updateInfoDefault();
+    }
+  }
+
+  private onClickState(stateId: string): void {
+    // If nothing selected, try to select a player state
+    if (this.selectedStateId === null) {
+      if (this.gsm.getOwner(stateId) === "player") {
+        this.selectedStateId = stateId;
+        this.redrawAll();
+        const vis = this.visuals.get(stateId)!;
+        const units = this.gsm.getUnits(stateId);
+        this.infoText.setText(`${vis.data.name} selected (${units} units) — click adjacent state to move`);
+      }
+      return;
+    }
+
+    // If clicking the already-selected state, deselect
+    if (stateId === this.selectedStateId) {
+      this.deselect();
+      return;
+    }
+
+    // If clicking a valid target, move units
+    if (this.isValidTarget(stateId)) {
+      this.executeMove(stateId);
+      return;
+    }
+
+    // If clicking another player state, switch selection
+    if (this.gsm.getOwner(stateId) === "player") {
+      this.selectedStateId = stateId;
+      this.redrawAll();
+      return;
+    }
+
+    // Otherwise deselect
+    this.deselect();
+  }
+
+  private isValidTarget(targetId: string): boolean {
+    if (!this.selectedStateId) return false;
+    const neighbors = adjacencyGraph[this.selectedStateId] ?? [];
+    if (!neighbors.includes(targetId)) return false;
+    // Valid target: same-owner friendly move, or enemy/neutral for future combat
+    return true;
+  }
+
+  private executeMove(targetId: string): void {
+    const fromId = this.selectedStateId!;
+    const fromState = this.gsm.state[fromId];
+    const toState = this.gsm.state[targetId];
+
+    // Move all but 1 unit
+    const moveCount = fromState.units - 1;
+    if (moveCount < 1) {
+      this.infoText.setText("Not enough units to move!");
+      this.deselect();
+      return;
+    }
+
+    if (toState.owner === fromState.owner) {
+      // Friendly move
+      this.gsm.moveUnits(fromId, targetId, moveCount);
+      const vis = this.visuals.get(targetId)!;
+      this.infoText.setText(`Moved ${moveCount} units to ${vis.data.name}`);
+    } else {
+      // Enemy/neutral — for now, just transfer if overwhelming (combat comes in step 5)
+      // Placeholder: simple capture if attacker > defender
+      if (moveCount > toState.units) {
+        fromState.units -= moveCount;
+        toState.units = moveCount - toState.units;
+        toState.owner = fromState.owner;
+        const vis = this.visuals.get(targetId)!;
+        this.infoText.setText(`Captured ${vis.data.name}!`);
+      } else {
+        // Failed attack — lose units equal to defender
+        fromState.units -= moveCount;
+        toState.units -= moveCount;
+        if (toState.units <= 0) {
+          toState.units = 1;
+        }
+        this.infoText.setText("Attack failed — not enough units!");
       }
     }
 
-    if (hovering) {
-      this.infoText.setText(state.name);
+    this.selectedStateId = null;
+    this.redrawAll();
+  }
+
+  private deselect(): void {
+    if (this.selectedStateId === null) return;
+    this.selectedStateId = null;
+    this.redrawAll();
+    this.updateInfoDefault();
+  }
+
+  private updateInfoDefault(): void {
+    if (this.selectedStateId) {
+      const vis = this.visuals.get(this.selectedStateId)!;
+      this.infoText.setText(`${vis.data.name} selected — click adjacent state to move`);
     } else {
-      this.infoText.setText("Click a state");
+      this.infoText.setText("Select one of your states (blue)");
     }
   }
 
-  private onStateClick(state: StateData): void {
-    this.infoText.setText(`Selected: ${state.name} (${state.id})`);
-  }
+  // ── Utilities ──
 
   private computeCentroid(polygon: [number, number][]): [number, number] {
     let cx = 0, cy = 0;
-    for (const [x, y] of polygon) {
-      cx += x;
-      cy += y;
-    }
+    for (const [x, y] of polygon) { cx += x; cy += y; }
     return [cx / polygon.length, cy / polygon.length];
   }
 
