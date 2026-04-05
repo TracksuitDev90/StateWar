@@ -18,6 +18,14 @@ export interface CombatResult {
 export interface RailwayState {
   from: string;
   to: string;
-  level: number;  // 0 = not built, 1-3 = upgrade tiers
   owner: Owner;   // who built/controls it
 }
+
+export interface UnitMoveEvent {
+  from: string;
+  to: string;
+  count: number;
+  owner: Owner;
+}
+
+export type MoveListener = (event: UnitMoveEvent) => void;

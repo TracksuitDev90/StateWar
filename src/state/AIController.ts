@@ -147,14 +147,16 @@ export class AIController {
       const units = this.gsm.getUnits(stateId);
       if (units < RAIL_BUILD_THRESHOLD) continue;
 
-      const buildable = this.gsm.getBuildableRailways(stateId);
-      if (buildable.length === 0) continue;
+      // Find an AI-owned state that isn't already connected by rail
+      for (const targetId of aiStates) {
+        if (targetId === stateId) continue;
+        if (this.gsm.getRailway(stateId, targetId)) continue;
+        // Prefer connecting to border states
+        if (!this.isBorderState(targetId)) continue;
 
-      // Pick the route connecting the most strategic endpoint
-      const best = buildable[0]; // just take the first available
-      const targetId = best.from === stateId ? best.to : best.from;
-      this.gsm.buildRailway(stateId, targetId);
-      return; // only one build per tick
+        const result = this.gsm.buildRailway(stateId, targetId);
+        if (result.success) return; // only one build per tick
+      }
     }
   }
 

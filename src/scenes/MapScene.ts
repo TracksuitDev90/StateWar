@@ -3,7 +3,7 @@ import { stateData, StateData } from "../data/states";
 import { stateBonuses } from "../data/stateBonuses";
 import { GameStateManager } from "../state/GameStateManager";
 import { LogicTick } from "../state/LogicTick";
-import { Owner, CombatResult } from "../types";
+import { Owner, CombatResult, UnitMoveEvent } from "../types";
 
 const DPR = Math.min(window.devicePixelRatio || 1, 2);
 
@@ -20,14 +20,10 @@ const BORDER_COLOR = 0x1f2937;
 const BORDER_WIDTH = 1.5 * DPR;
 const SELECTED_BORDER_WIDTH = 3 * DPR;
 
-// Railway colors by level
-const RAIL_COLORS: Record<number, number> = {
-  1: 0x9ca3af, // gray — slow
-  2: 0xfbbf24, // yellow — standard
-  3: 0x22d3ee, // cyan — express
-};
-const RAIL_UNBUILT_COLOR = 0x374151;
-const RAIL_LINE_WIDTH = [0, 1.5, 2.5, 3.5]; // by level
+// Railway visuals
+const RAIL_COLOR_PLAYER = 0x60a5fa; // blue tint for player rails
+const RAIL_COLOR_AI = 0xf87171;     // red tint for AI rails
+const RAIL_LINE_WIDTH = 2.5;
 
 interface StateVisual {
   data: StateData;
@@ -38,6 +34,8 @@ interface StateVisual {
 }
 
 type InteractionMode = "select" | "build";
+
+
 
 function scaledPolygon(polygon: [number, number][]): [number, number][] {
   return polygon.map(([x, y]) => [x * DPR, y * DPR]);
@@ -61,6 +59,18 @@ export class MapScene extends Phaser.Scene {
   create(): void {
     this.cameras.main.setBackgroundColor(0x111827);
     this.gsm = new GameStateManager();
+
+    // Listen for AI/consolidation move events and animate them
+    this.gsm.onMove((event: UnitMoveEvent) => {
+      const fromVis = this.visuals.get(event.from);
+      const toVis = this.visuals.get(event.to);
+      if (fromVis && toVis) {
+        const color = event.owner === "player" ? 0x60a5fa : 0xf87171;
+        this.animateUnitMovement(fromVis, toVis, event.count, color, () => {
+          this.redrawAll();
+        });
+      }
+    });
 
     // Railway layer (drawn under states)
     this.railGfx = this.add.graphics().setDepth(0);
@@ -190,56 +200,21 @@ export class MapScene extends Phaser.Scene {
       const tx = toVis.centroid[0] * DPR;
       const ty = toVis.centroid[1] * DPR;
 
-      if (rail.level === 0) {
-        // Show potential routes as faint dotted lines in build mode
-        if (this.mode === "build") {
-          this.drawDashedLine(this.railGfx, fx, fy, tx, ty, RAIL_UNBUILT_COLOR, 1 * DPR, 6 * DPR);
-        }
-      } else {
-        // Built railway — solid colored line
-        const color = RAIL_COLORS[rail.level] ?? 0xffffff;
-        const width = RAIL_LINE_WIDTH[rail.level] * DPR;
-        this.railGfx.lineStyle(width, color, 0.8);
-        this.railGfx.beginPath();
-        this.railGfx.moveTo(fx, fy);
-        this.railGfx.lineTo(tx, ty);
-        this.railGfx.strokePath();
+      const color = rail.owner === "player" ? RAIL_COLOR_PLAYER : RAIL_COLOR_AI;
+      const width = RAIL_LINE_WIDTH * DPR;
+      this.railGfx.lineStyle(width, color, 0.8);
+      this.railGfx.beginPath();
+      this.railGfx.moveTo(fx, fy);
+      this.railGfx.lineTo(tx, ty);
+      this.railGfx.strokePath();
 
-        // Draw small diamond at midpoint for built rails
-        const mx = (fx + tx) / 2;
-        const my = (fy + ty) / 2;
-        const s = 3 * DPR;
-        this.railGfx.fillStyle(color, 1);
-        this.railGfx.fillTriangle(mx, my - s, mx + s, my, mx, my + s);
-        this.railGfx.fillTriangle(mx, my - s, mx - s, my, mx, my + s);
-      }
-    }
-  }
-
-  private drawDashedLine(
-    gfx: Phaser.GameObjects.Graphics,
-    x1: number, y1: number, x2: number, y2: number,
-    color: number, width: number, dashLen: number,
-  ): void {
-    const dx = x2 - x1;
-    const dy = y2 - y1;
-    const len = Math.sqrt(dx * dx + dy * dy);
-    const nx = dx / len;
-    const ny = dy / len;
-
-    gfx.lineStyle(width, color, 0.4);
-    let drawn = 0;
-    let drawing = true;
-    while (drawn < len) {
-      const seg = Math.min(dashLen, len - drawn);
-      if (drawing) {
-        gfx.beginPath();
-        gfx.moveTo(x1 + nx * drawn, y1 + ny * drawn);
-        gfx.lineTo(x1 + nx * (drawn + seg), y1 + ny * (drawn + seg));
-        gfx.strokePath();
-      }
-      drawn += seg;
-      drawing = !drawing;
+      // Small diamond at midpoint
+      const mx = (fx + tx) / 2;
+      const my = (fy + ty) / 2;
+      const s = 3 * DPR;
+      this.railGfx.fillStyle(color, 1);
+      this.railGfx.fillTriangle(mx, my - s, mx + s, my, mx, my + s);
+      this.railGfx.fillTriangle(mx, my - s, mx - s, my, mx, my + s);
     }
   }
 
@@ -303,19 +278,15 @@ export class MapScene extends Phaser.Scene {
       const defStr = def !== 1.0 ? ` | def ×${def}` : "";
 
       if (this.mode === "build" && this.selectedStateId) {
-        // Show build cost preview
-        const rail = this.gsm.getRailway(this.selectedStateId, stateId);
-        if (rail) {
-          const nextLvl = rail.level + 1;
-          const costMap: Record<number, number> = { 1: 5, 2: 8, 3: 12 };
-          const cost = costMap[nextLvl];
-          if (cost) {
-            this.infoText.setText(`${vis.data.name} | Build Lv${nextLvl} rail — costs ${cost} units`);
-          } else {
-            this.infoText.setText(`${vis.data.name} | Railway maxed out`);
-          }
-          return;
+        const existing = this.gsm.getRailway(this.selectedStateId, stateId);
+        if (existing) {
+          this.infoText.setText(`${vis.data.name} | Rail already connected`);
+        } else if (this.gsm.getOwner(stateId) === "player") {
+          this.infoText.setText(`${vis.data.name} | Build rail — costs 5 units`);
+        } else {
+          this.infoText.setText(`${vis.data.name} | Must own this state to build rail`);
         }
+        return;
       }
 
       const genRate = this.logicTick.getGenRate(stateId);
@@ -324,7 +295,7 @@ export class MapScene extends Phaser.Scene {
       const bonusStr = bonus ? ` | ${bonus.description}` : "";
 
       // Show railway info
-      const rails = this.gsm.getRailwaysForState(stateId).filter(r => r.level > 0);
+      const rails = this.gsm.getRailwaysForState(stateId);
       const railStr = rails.length > 0
         ? ` | ${rails.length} rail${rails.length > 1 ? "s" : ""}`
         : "";
@@ -376,15 +347,10 @@ export class MapScene extends Phaser.Scene {
     if (this.selectedStateId === null) {
       // Select source state for building
       if (this.gsm.getOwner(stateId) === "player") {
-        const buildable = this.gsm.getBuildableRailways(stateId);
-        if (buildable.length === 0) {
-          this.infoText.setText("No railway routes available from this state");
-          return;
-        }
         this.selectedStateId = stateId;
         this.redrawAll();
         const vis = this.visuals.get(stateId)!;
-        this.infoText.setText(`${vis.data.name} — tap a connected state to build/upgrade rail`);
+        this.infoText.setText(`${vis.data.name} — tap any other state you own to build a rail`);
       }
       return;
     }
@@ -394,14 +360,9 @@ export class MapScene extends Phaser.Scene {
       return;
     }
 
-    // Try to build railway
+    // Try to build railway between any two owned states
     const result = this.gsm.buildRailway(this.selectedStateId, stateId);
-    if (result.success) {
-      this.infoText.setText(result.message);
-    } else {
-      this.infoText.setText(result.message);
-    }
-
+    this.infoText.setText(result.message);
     this.deselect();
     this.redrawAll();
   }
@@ -410,9 +371,10 @@ export class MapScene extends Phaser.Scene {
     if (!this.selectedStateId) return false;
 
     if (this.mode === "build") {
-      // In build mode, valid targets are states with railway routes from selected
-      const rail = this.gsm.getRailway(this.selectedStateId, targetId);
-      return rail !== undefined && rail.level < 3;
+      // In build mode, any other owned state without an existing rail is valid
+      if (this.gsm.getOwner(targetId) !== "player") return false;
+      const existing = this.gsm.getRailway(this.selectedStateId, targetId);
+      return !existing;
     }
 
     return this.gsm.canMove(this.selectedStateId, targetId)
@@ -423,7 +385,7 @@ export class MapScene extends Phaser.Scene {
     const fromId = this.selectedStateId!;
     const fromOwner = this.gsm.getOwner(fromId);
     const toOwner = this.gsm.getOwner(targetId);
-    let attackers = this.gsm.getUnits(fromId) - 1;
+    const attackers = this.gsm.getUnits(fromId) - 1;
 
     if (attackers < 1) {
       this.infoText.setText("Not enough units to move!");
@@ -431,43 +393,105 @@ export class MapScene extends Phaser.Scene {
       return;
     }
 
+    const fromVis = this.visuals.get(fromId)!;
     const targetVis = this.visuals.get(targetId)!;
 
-    // Apply express rail bonus
-    const expressBonus = this.gsm.getRailExpressBonus(fromId, targetId);
+    // Deduct units from source immediately (so player sees them leave)
+    this.gsm.state[fromId].units = 1;
 
-    if (fromOwner === toOwner) {
-      this.gsm.moveUnits(fromId, targetId, attackers);
-      if (expressBonus > 0) {
-        // Express bonus: add extra units at destination
-        const bonus = Math.floor(attackers * expressBonus);
-        if (bonus > 0) {
-          this.gsm.state[targetId].units += bonus;
-          this.infoText.setText(`Moved ${attackers}+${bonus} units to ${targetVis.data.name} (Express)`);
-        } else {
-          this.infoText.setText(`Moved ${attackers} units to ${targetVis.data.name}`);
-        }
-      } else {
+    // Animate circles flying to target, then resolve on arrival
+    const color = fromOwner === "player" ? 0x60a5fa : 0xf87171;
+    this.animateUnitMovement(fromVis, targetVis, attackers, color, () => {
+      if (fromOwner === toOwner) {
+        // Friendly move — add units at destination
+        this.gsm.state[targetId].units += attackers;
         this.infoText.setText(`Moved ${attackers} units to ${targetVis.data.name}`);
-      }
-    } else {
-      if (expressBonus > 0) {
-        attackers += Math.floor(attackers * expressBonus);
-      }
-      const result: CombatResult = this.gsm.resolveCombat(fromId, targetId, attackers);
-      if (result.captured) {
-        this.infoText.setText(
-          `Captured ${targetVis.data.name}! Lost ${result.attackerLost}, killed ${result.defenderLost}`
-        );
       } else {
-        this.infoText.setText(
-          `Attack on ${targetVis.data.name} failed! Lost ${result.attackerLost}, killed ${result.defenderLost}`
-        );
+        // Combat — resolve on arrival
+        const result: CombatResult = this.gsm.resolveCombat(fromId, targetId, attackers, true);
+        if (result.captured) {
+          this.infoText.setText(
+            `Captured ${targetVis.data.name}! Lost ${result.attackerLost}, killed ${result.defenderLost}`
+          );
+        } else {
+          this.infoText.setText(
+            `Attack on ${targetVis.data.name} failed! Lost ${result.attackerLost}, killed ${result.defenderLost}`
+          );
+        }
       }
-    }
+      this.redrawAll();
+    });
 
     this.selectedStateId = null;
     this.redrawAll();
+  }
+
+  /** Animate circles moving from one state to another, then call onComplete */
+  private animateUnitMovement(
+    fromVis: StateVisual,
+    toVis: StateVisual,
+    count: number,
+    color: number,
+    onComplete: () => void,
+  ): void {
+    const sx = fromVis.centroid[0] * DPR;
+    const sy = fromVis.centroid[1] * DPR;
+    const tx = toVis.centroid[0] * DPR;
+    const ty = toVis.centroid[1] * DPR;
+
+    const dx = tx - sx;
+    const dy = ty - sy;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const duration = Math.max(300, Math.min(800, dist * 1.5)); // 300-800ms based on distance
+
+    // Create a cluster of small circles (up to 5 visual dots)
+    const dotCount = Math.min(count, 5);
+    const dots: Phaser.GameObjects.Arc[] = [];
+
+    for (let i = 0; i < dotCount; i++) {
+      const radius = Math.max(3, Math.min(6, 2 + count / 5)) * DPR;
+      const dot = this.add.circle(sx, sy, radius, color, 0.9).setDepth(5);
+      dots.push(dot);
+    }
+
+    // Unit count label that travels with the dots
+    const label = this.add.text(sx, sy - 10 * DPR, String(count), {
+      fontSize: `${Math.round(12 * DPR)}px`,
+      color: "#ffffff",
+      fontFamily: "'Segoe UI', Arial, sans-serif",
+      fontStyle: "bold",
+      stroke: "#000000",
+      strokeThickness: 3 * DPR,
+    }).setOrigin(0.5).setDepth(6);
+
+    // Stagger the dots slightly for a "stream" look
+    for (let i = 0; i < dots.length; i++) {
+      const delay = i * 40;
+      this.tweens.add({
+        targets: dots[i],
+        x: tx,
+        y: ty,
+        duration,
+        delay,
+        ease: "Sine.easeInOut",
+        onComplete: () => {
+          dots[i].destroy();
+        },
+      });
+    }
+
+    // Tween the label along with the dots
+    this.tweens.add({
+      targets: label,
+      x: tx,
+      y: ty - 10 * DPR,
+      duration,
+      ease: "Sine.easeInOut",
+      onComplete: () => {
+        label.destroy();
+        onComplete();
+      },
+    });
   }
 
   private deselect(): void {
@@ -493,7 +517,7 @@ export class MapScene extends Phaser.Scene {
     const pUnits = this.logicTick.countUnits("player");
     const aStates = this.logicTick.countStates("ai");
     const aUnits = this.logicTick.countUnits("ai");
-    const builtRails = this.gsm.railways.filter(r => r.level > 0).length;
+    const builtRails = this.gsm.railways.length;
     const railStr = builtRails > 0 ? `  |  Rails: ${builtRails}` : "";
     this.statsText.setText(
       `You: ${pStates} states, ${pUnits} units  |  AI: ${aStates} states, ${aUnits} units${railStr}`
