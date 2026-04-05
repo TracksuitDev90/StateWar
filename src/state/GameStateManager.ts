@@ -4,9 +4,9 @@ import { adjacencyGraph } from "../data/adjacency";
 import { stateDefenseBonus } from "../data/stateDefense";
 import { railwayRoutes, RAIL_UPGRADE_COSTS, RAIL_EXPRESS_BONUS } from "../data/railways";
 
-const PLAYER_START = ["CA", "OR", "WA", "NV", "ID"];
-const AI_START = ["NY", "PA", "NJ", "CT", "MA"];
-const STARTING_UNITS = 5;
+const PLAYER_START = ["CA"];
+const AI_START = ["NY"];
+const STARTING_UNITS = 10;
 const NEUTRAL_UNITS = 2;
 
 export class GameStateManager {

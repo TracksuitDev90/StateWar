@@ -1,24 +1,28 @@
 import { GameStateManager } from "./GameStateManager";
+import { AIController } from "./AIController";
 import { Owner } from "../types";
 import { stateBonuses } from "../data/stateBonuses";
 
 const TICK_INTERVAL_MS = 1000;
-const BASE_GEN_PER_STATE = 0.3; // base units generated per owned state per tick
-const GEN_CAP = 99; // max units per state
+const BASE_GEN_PER_STATE = 0.3;
+const GEN_CAP = 99;
+const AI_TICK_INTERVAL = 3; // AI acts every 3 ticks (3 seconds)
 
 export type TickCallback = () => void;
 
 export class LogicTick {
   private gsm: GameStateManager;
+  private ai: AIController;
   private timerId: number | null = null;
   private accumulators: Record<string, number> = {};
   private onTick: TickCallback;
+  private tickCount = 0;
 
   constructor(gsm: GameStateManager, onTick: TickCallback) {
     this.gsm = gsm;
+    this.ai = new AIController(gsm);
     this.onTick = onTick;
 
-    // Initialize fractional accumulators for every state
     for (const id of Object.keys(gsm.state)) {
       this.accumulators[id] = 0;
     }
@@ -37,16 +41,23 @@ export class LogicTick {
   }
 
   private tick(): void {
+    this.tickCount++;
+
+    // Unit generation for all owned states
     for (const [id, territory] of Object.entries(this.gsm.state)) {
       if (territory.owner === "neutral") continue;
       if (territory.units >= GEN_CAP) continue;
 
       const bonus = stateBonuses[id]?.genBonus ?? 0;
-      const genRate = BASE_GEN_PER_STATE + bonus;
+      let genRate = BASE_GEN_PER_STATE + bonus;
+
+      // Apply rubber-band bonus to AI states
+      if (territory.owner === "ai") {
+        genRate += this.ai.rubberBandBonus;
+      }
 
       this.accumulators[id] += genRate;
 
-      // When accumulator reaches 1+, convert to whole units
       if (this.accumulators[id] >= 1) {
         const whole = Math.floor(this.accumulators[id]);
         this.accumulators[id] -= whole;
@@ -54,26 +65,34 @@ export class LogicTick {
       }
     }
 
+    // AI acts every few ticks to feel more natural
+    if (this.tickCount % AI_TICK_INTERVAL === 0) {
+      this.ai.update();
+    }
+
     this.onTick();
   }
 
-  /** Get the effective gen rate for a state (for UI display) */
   getGenRate(stateId: string): number {
     const territory = this.gsm.state[stateId];
     if (!territory || territory.owner === "neutral") return 0;
     const bonus = stateBonuses[stateId]?.genBonus ?? 0;
-    return BASE_GEN_PER_STATE + bonus;
+    let rate = BASE_GEN_PER_STATE + bonus;
+    if (territory.owner === "ai") rate += this.ai.rubberBandBonus;
+    return rate;
   }
 
-  /** Count total states owned by a given owner */
   countStates(owner: Owner): number {
     return Object.values(this.gsm.state).filter(t => t.owner === owner).length;
   }
 
-  /** Count total units owned by a given owner */
   countUnits(owner: Owner): number {
     return Object.values(this.gsm.state)
       .filter(t => t.owner === owner)
       .reduce((sum, t) => sum + t.units, 0);
+  }
+
+  getRubberBandBonus(): number {
+    return this.ai.rubberBandBonus;
   }
 }
