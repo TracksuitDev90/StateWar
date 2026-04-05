@@ -20,6 +20,15 @@ const BORDER_COLOR = 0x1f2937;
 const BORDER_WIDTH = 1.5 * DPR;
 const SELECTED_BORDER_WIDTH = 3 * DPR;
 
+// Railway colors by level
+const RAIL_COLORS: Record<number, number> = {
+  1: 0x9ca3af, // gray — slow
+  2: 0xfbbf24, // yellow — standard
+  3: 0x22d3ee, // cyan — express
+};
+const RAIL_UNBUILT_COLOR = 0x374151;
+const RAIL_LINE_WIDTH = [0, 1.5, 2.5, 3.5]; // by level
+
 interface StateVisual {
   data: StateData;
   gfxList: Phaser.GameObjects.Graphics[];
@@ -28,7 +37,8 @@ interface StateVisual {
   centroid: [number, number];
 }
 
-// Scale polygon coordinates by DPR
+type InteractionMode = "select" | "build";
+
 function scaledPolygon(polygon: [number, number][]): [number, number][] {
   return polygon.map(([x, y]) => [x * DPR, y * DPR]);
 }
@@ -40,6 +50,9 @@ export class MapScene extends Phaser.Scene {
   private selectedStateId: string | null = null;
   private infoText!: Phaser.GameObjects.Text;
   private statsText!: Phaser.GameObjects.Text;
+  private railGfx!: Phaser.GameObjects.Graphics;
+  private modeText!: Phaser.GameObjects.Text;
+  private mode: InteractionMode = "select";
 
   constructor() {
     super({ key: "MapScene" });
@@ -48,6 +61,9 @@ export class MapScene extends Phaser.Scene {
   create(): void {
     this.cameras.main.setBackgroundColor(0x111827);
     this.gsm = new GameStateManager();
+
+    // Railway layer (drawn under states)
+    this.railGfx = this.add.graphics().setDepth(0);
 
     // Build visuals for each state
     for (const state of stateData) {
@@ -59,7 +75,7 @@ export class MapScene extends Phaser.Scene {
       for (const polygon of state.polygons) {
         if (polygon.length < 3) continue;
 
-        const gfx = this.add.graphics();
+        const gfx = this.add.graphics().setDepth(1);
         const scaled = scaledPolygon(polygon);
         const flatPoints: number[] = [];
         for (const [x, y] of scaled) flatPoints.push(x, y);
@@ -80,7 +96,7 @@ export class MapScene extends Phaser.Scene {
         fontStyle: "bold",
         stroke: "#000000",
         strokeThickness: 3 * DPR,
-      }).setOrigin(0.5).setDepth(1);
+      }).setOrigin(0.5).setDepth(3);
 
       const unitText = this.add.text(cx, cy + 8 * DPR, "", {
         fontSize: `${Math.round(14 * DPR)}px`,
@@ -89,7 +105,7 @@ export class MapScene extends Phaser.Scene {
         fontStyle: "bold",
         stroke: "#000000",
         strokeThickness: 4 * DPR,
-      }).setOrigin(0.5).setDepth(1);
+      }).setOrigin(0.5).setDepth(3);
 
       this.visuals.set(state.id, { data: state, gfxList, label, unitText, centroid });
     }
@@ -99,7 +115,7 @@ export class MapScene extends Phaser.Scene {
       fontSize: `${Math.round(18 * DPR)}px`,
       color: "#ffffff",
       fontFamily: "'Segoe UI', Arial, sans-serif",
-    }).setOrigin(0.5, 0).setDepth(2);
+    }).setOrigin(0.5, 0).setDepth(4);
 
     // Stats display (bottom-right)
     this.statsText = this.add.text(1270 * DPR, 708 * DPR, "", {
@@ -107,7 +123,19 @@ export class MapScene extends Phaser.Scene {
       color: "#d1d5db",
       fontFamily: "'Segoe UI', Arial, sans-serif",
       align: "right",
-    }).setOrigin(1, 1).setDepth(2);
+    }).setOrigin(1, 1).setDepth(4);
+
+    // Mode toggle button (bottom-left)
+    this.modeText = this.add.text(10 * DPR, 708 * DPR, "[R] Build Rails", {
+      fontSize: `${Math.round(14 * DPR)}px`,
+      color: "#fbbf24",
+      fontFamily: "'Segoe UI', Arial, sans-serif",
+      fontStyle: "bold",
+      backgroundColor: "#1f2937",
+      padding: { x: 6 * DPR, y: 3 * DPR },
+    }).setOrigin(0, 1).setDepth(4).setInteractive({ useHandCursor: true });
+
+    this.modeText.on("pointerdown", () => this.toggleMode());
 
     // Right-click or Escape to deselect
     this.input.on("pointerdown", (pointer: Phaser.Input.Pointer) => {
@@ -115,6 +143,7 @@ export class MapScene extends Phaser.Scene {
     });
     if (this.input.keyboard) {
       this.input.keyboard.on("keydown-ESC", () => this.deselect());
+      this.input.keyboard.on("keydown-R", () => this.toggleMode());
     }
 
     // Start logic tick (1000ms interval, separate from 60fps render)
@@ -128,11 +157,89 @@ export class MapScene extends Phaser.Scene {
     this.updateStats();
   }
 
+  // ── Mode ──
+
+  private toggleMode(): void {
+    this.deselect();
+    this.mode = this.mode === "select" ? "build" : "select";
+    this.modeText.setText(this.mode === "select" ? "[R] Build Rails" : "[R] Move Units");
+    this.modeText.setColor(this.mode === "select" ? "#fbbf24" : "#22d3ee");
+    this.updateInfoDefault();
+    this.redrawAll();
+  }
+
   // ── Rendering ──
 
   private redrawAll(): void {
+    this.drawRailways();
     for (const [id, vis] of this.visuals) {
       this.redrawState(id, vis);
+    }
+  }
+
+  private drawRailways(): void {
+    this.railGfx.clear();
+
+    for (const rail of this.gsm.railways) {
+      const fromVis = this.visuals.get(rail.from);
+      const toVis = this.visuals.get(rail.to);
+      if (!fromVis || !toVis) continue;
+
+      const fx = fromVis.centroid[0] * DPR;
+      const fy = fromVis.centroid[1] * DPR;
+      const tx = toVis.centroid[0] * DPR;
+      const ty = toVis.centroid[1] * DPR;
+
+      if (rail.level === 0) {
+        // Show potential routes as faint dotted lines in build mode
+        if (this.mode === "build") {
+          this.drawDashedLine(this.railGfx, fx, fy, tx, ty, RAIL_UNBUILT_COLOR, 1 * DPR, 6 * DPR);
+        }
+      } else {
+        // Built railway — solid colored line
+        const color = RAIL_COLORS[rail.level] ?? 0xffffff;
+        const width = RAIL_LINE_WIDTH[rail.level] * DPR;
+        this.railGfx.lineStyle(width, color, 0.8);
+        this.railGfx.beginPath();
+        this.railGfx.moveTo(fx, fy);
+        this.railGfx.lineTo(tx, ty);
+        this.railGfx.strokePath();
+
+        // Draw small diamond at midpoint for built rails
+        const mx = (fx + tx) / 2;
+        const my = (fy + ty) / 2;
+        const s = 3 * DPR;
+        this.railGfx.fillStyle(color, 1);
+        this.railGfx.fillTriangle(mx, my - s, mx + s, my, mx, my + s);
+        this.railGfx.fillTriangle(mx, my - s, mx - s, my, mx, my + s);
+      }
+    }
+  }
+
+  private drawDashedLine(
+    gfx: Phaser.GameObjects.Graphics,
+    x1: number, y1: number, x2: number, y2: number,
+    color: number, width: number, dashLen: number,
+  ): void {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    const nx = dx / len;
+    const ny = dy / len;
+
+    gfx.lineStyle(width, color, 0.4);
+    let drawn = 0;
+    let drawing = true;
+    while (drawn < len) {
+      const seg = Math.min(dashLen, len - drawn);
+      if (drawing) {
+        gfx.beginPath();
+        gfx.moveTo(x1 + nx * drawn, y1 + ny * drawn);
+        gfx.lineTo(x1 + nx * (drawn + seg), y1 + ny * (drawn + seg));
+        gfx.strokePath();
+      }
+      drawn += seg;
+      drawing = !drawing;
     }
   }
 
@@ -194,17 +301,47 @@ export class MapScene extends Phaser.Scene {
       const units = this.gsm.getUnits(stateId);
       const def = this.gsm.getDefenseBonus(stateId);
       const defStr = def !== 1.0 ? ` | def ×${def}` : "";
+
+      if (this.mode === "build" && this.selectedStateId) {
+        // Show build cost preview
+        const rail = this.gsm.getRailway(this.selectedStateId, stateId);
+        if (rail) {
+          const nextLvl = rail.level + 1;
+          const costMap: Record<number, number> = { 1: 5, 2: 8, 3: 12 };
+          const cost = costMap[nextLvl];
+          if (cost) {
+            this.infoText.setText(`${vis.data.name} | Build Lv${nextLvl} rail — costs ${cost} units`);
+          } else {
+            this.infoText.setText(`${vis.data.name} | Railway maxed out`);
+          }
+          return;
+        }
+      }
+
       const genRate = this.logicTick.getGenRate(stateId);
       const genStr = genRate > 0 ? ` | +${genRate.toFixed(1)}/s` : "";
       const bonus = stateBonuses[stateId];
       const bonusStr = bonus ? ` | ${bonus.description}` : "";
-      this.infoText.setText(`${vis.data.name} | ${owner} | ${units} units${defStr}${genStr}${bonusStr}`);
+
+      // Show railway info
+      const rails = this.gsm.getRailwaysForState(stateId).filter(r => r.level > 0);
+      const railStr = rails.length > 0
+        ? ` | ${rails.length} rail${rails.length > 1 ? "s" : ""}`
+        : "";
+
+      this.infoText.setText(`${vis.data.name} | ${owner} | ${units} units${defStr}${genStr}${bonusStr}${railStr}`);
     } else {
       this.updateInfoDefault();
     }
   }
 
   private onClickState(stateId: string): void {
+    if (this.mode === "build") {
+      this.onClickStateBuildMode(stateId);
+      return;
+    }
+
+    // Select mode
     if (this.selectedStateId === null) {
       if (this.gsm.getOwner(stateId) === "player") {
         this.selectedStateId = stateId;
@@ -235,8 +372,49 @@ export class MapScene extends Phaser.Scene {
     this.deselect();
   }
 
+  private onClickStateBuildMode(stateId: string): void {
+    if (this.selectedStateId === null) {
+      // Select source state for building
+      if (this.gsm.getOwner(stateId) === "player") {
+        const buildable = this.gsm.getBuildableRailways(stateId);
+        if (buildable.length === 0) {
+          this.infoText.setText("No railway routes available from this state");
+          return;
+        }
+        this.selectedStateId = stateId;
+        this.redrawAll();
+        const vis = this.visuals.get(stateId)!;
+        this.infoText.setText(`${vis.data.name} — tap a connected state to build/upgrade rail`);
+      }
+      return;
+    }
+
+    if (stateId === this.selectedStateId) {
+      this.deselect();
+      return;
+    }
+
+    // Try to build railway
+    const result = this.gsm.buildRailway(this.selectedStateId, stateId);
+    if (result.success) {
+      this.infoText.setText(result.message);
+    } else {
+      this.infoText.setText(result.message);
+    }
+
+    this.deselect();
+    this.redrawAll();
+  }
+
   private isValidTarget(targetId: string): boolean {
     if (!this.selectedStateId) return false;
+
+    if (this.mode === "build") {
+      // In build mode, valid targets are states with railway routes from selected
+      const rail = this.gsm.getRailway(this.selectedStateId, targetId);
+      return rail !== undefined && rail.level < 3;
+    }
+
     return this.gsm.canMove(this.selectedStateId, targetId)
       || this.gsm.canAttack(this.selectedStateId, targetId);
   }
@@ -245,7 +423,7 @@ export class MapScene extends Phaser.Scene {
     const fromId = this.selectedStateId!;
     const fromOwner = this.gsm.getOwner(fromId);
     const toOwner = this.gsm.getOwner(targetId);
-    const attackers = this.gsm.getUnits(fromId) - 1;
+    let attackers = this.gsm.getUnits(fromId) - 1;
 
     if (attackers < 1) {
       this.infoText.setText("Not enough units to move!");
@@ -255,10 +433,27 @@ export class MapScene extends Phaser.Scene {
 
     const targetVis = this.visuals.get(targetId)!;
 
+    // Apply express rail bonus
+    const expressBonus = this.gsm.getRailExpressBonus(fromId, targetId);
+
     if (fromOwner === toOwner) {
       this.gsm.moveUnits(fromId, targetId, attackers);
-      this.infoText.setText(`Moved ${attackers} units to ${targetVis.data.name}`);
+      if (expressBonus > 0) {
+        // Express bonus: add extra units at destination
+        const bonus = Math.floor(attackers * expressBonus);
+        if (bonus > 0) {
+          this.gsm.state[targetId].units += bonus;
+          this.infoText.setText(`Moved ${attackers}+${bonus} units to ${targetVis.data.name} (Express)`);
+        } else {
+          this.infoText.setText(`Moved ${attackers} units to ${targetVis.data.name}`);
+        }
+      } else {
+        this.infoText.setText(`Moved ${attackers} units to ${targetVis.data.name}`);
+      }
     } else {
+      if (expressBonus > 0) {
+        attackers += Math.floor(attackers * expressBonus);
+      }
       const result: CombatResult = this.gsm.resolveCombat(fromId, targetId, attackers);
       if (result.captured) {
         this.infoText.setText(
@@ -283,7 +478,9 @@ export class MapScene extends Phaser.Scene {
   }
 
   private updateInfoDefault(): void {
-    if (this.selectedStateId) {
+    if (this.mode === "build") {
+      this.infoText.setText("BUILD MODE — select a state to build/upgrade railways");
+    } else if (this.selectedStateId) {
       const vis = this.visuals.get(this.selectedStateId)!;
       this.infoText.setText(`${vis.data.name} selected — tap adjacent state`);
     } else {
@@ -296,8 +493,10 @@ export class MapScene extends Phaser.Scene {
     const pUnits = this.logicTick.countUnits("player");
     const aStates = this.logicTick.countStates("ai");
     const aUnits = this.logicTick.countUnits("ai");
+    const builtRails = this.gsm.railways.filter(r => r.level > 0).length;
+    const railStr = builtRails > 0 ? `  |  Rails: ${builtRails}` : "";
     this.statsText.setText(
-      `You: ${pStates} states, ${pUnits} units  |  AI: ${aStates} states, ${aUnits} units`
+      `You: ${pStates} states, ${pUnits} units  |  AI: ${aStates} states, ${aUnits} units${railStr}`
     );
   }
 

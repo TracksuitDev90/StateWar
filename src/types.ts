@@ -14,3 +14,10 @@ export interface CombatResult {
   remainingAttackers: number;
   remainingDefenders: number;
 }
+
+export interface RailwayState {
+  from: string;
+  to: string;
+  level: number;  // 0 = not built, 1-3 = upgrade tiers
+  owner: Owner;   // who built/controls it
+}
