@@ -437,8 +437,13 @@ export class MapScene extends Phaser.Scene {
         this.infoText.setText(`Moved ${attackers} units to ${targetVis.data.name}`);
       } else {
         // Combat — resolve on arrival
+        const wasNeutral = toOwner === "neutral";
         const result: CombatResult = this.gsm.resolveCombat(fromId, targetId, attackers, true);
-        if (result.captured) {
+        if (result.captured && wasNeutral) {
+          this.infoText.setText(
+            `Claimed ${targetVis.data.name}! Lost ${result.attackerLost}, ${result.remainingAttackers} units garrison`
+          );
+        } else if (result.captured) {
           this.infoText.setText(
             `${targetVis.data.name} neutralized! Lost ${result.attackerLost}, killed ${result.defenderLost} — claim it!`
           );
