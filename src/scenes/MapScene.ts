@@ -440,7 +440,7 @@ export class MapScene extends Phaser.Scene {
         const result: CombatResult = this.gsm.resolveCombat(fromId, targetId, attackers, true);
         if (result.captured) {
           this.infoText.setText(
-            `Captured ${targetVis.data.name}! Lost ${result.attackerLost}, killed ${result.defenderLost}`
+            `${targetVis.data.name} neutralized! Lost ${result.attackerLost}, killed ${result.defenderLost} — claim it!`
           );
         } else {
           this.infoText.setText(
