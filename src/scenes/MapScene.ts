@@ -35,10 +35,9 @@ const WALL_L2_COLOR_INNER = 0x6a6a7a;  // lighter fortress inner
 const WALL_L2_COLOR_TOP   = 0x8a8a9a;  // top highlight for 2.5D
 const DOUBLE_TAP_MS = 400; // max ms between taps for double-tap
 
-// Mobile camera zoom
-const MOBILE_ZOOM = 1.8;
-const MOBILE_MIN_ZOOM = 1.2;
-const MOBILE_MAX_ZOOM = 3.0;
+// Mobile pinch-to-zoom bounds
+const MOBILE_MIN_ZOOM = 0.6;
+const MOBILE_MAX_ZOOM = 2.5;
 
 // Game event feed
 const MAX_FEED_EVENTS = 5;
@@ -103,13 +102,14 @@ export class MapScene extends Phaser.Scene {
   create(): void {
     this.cameras.main.setBackgroundColor(0x111827);
 
-    // On mobile, zoom in for a detailed, cropped view
+    // On mobile, the game canvas matches the phone screen (set in main.ts).
+    // The map world is 1280×720 * DPR — larger than the viewport — so the
+    // camera shows a cropped, detailed view and the player pans to explore.
     if (IS_MOBILE) {
       const cam = this.cameras.main;
       cam.setBounds(0, 0, 1280 * DPR, 720 * DPR);
-      cam.setZoom(MOBILE_ZOOM);
-      // Center on the middle of the map initially
-      cam.centerOn(640 * DPR, 360 * DPR);
+      // Start centered on California (player start) — left-center of map
+      cam.centerOn(300 * DPR, 400 * DPR);
     }
 
     this.gsm = new GameStateManager();
@@ -156,8 +156,8 @@ export class MapScene extends Phaser.Scene {
         gfxList.push(gfx);
       }
 
-      const labelSize = IS_MOBILE ? Math.round(10 * DPR) : Math.round(12 * DPR);
-      const unitSize = IS_MOBILE ? Math.round(11 * DPR) : Math.round(14 * DPR);
+      const labelSize = Math.round(12 * DPR);
+      const unitSize = Math.round(14 * DPR);
 
       const label = this.add.text(cx, cy - 8 * DPR, state.id, {
         fontSize: `${labelSize}px`,
@@ -180,24 +180,26 @@ export class MapScene extends Phaser.Scene {
       this.visuals.set(state.id, { data: state, gfxList, label, unitText, centroid });
     }
 
-    // Info bar — fixed to viewport on mobile
-    const infoSize = IS_MOBILE ? Math.round(13 * DPR) : Math.round(18 * DPR);
-    const infoY = IS_MOBILE ? 6 * DPR : 14 * DPR;
+    // Screen dimensions (actual game canvas size)
     const screenW = Number(this.game.config.width);
     const screenH = Number(this.game.config.height);
-    const infoCx = IS_MOBILE ? screenW / (2 * MOBILE_ZOOM) : 640 * DPR;
+
+    // Info bar — fixed to viewport on mobile
+    const infoSize = IS_MOBILE ? Math.round(15 * DPR) : Math.round(18 * DPR);
+    const infoY = IS_MOBILE ? 6 * DPR : 14 * DPR;
+    const infoCx = IS_MOBILE ? screenW / 2 : 640 * DPR;
     this.infoText = this.add.text(infoCx, infoY, "Select one of your states (blue)", {
       fontSize: `${infoSize}px`,
       color: "#ffffff",
       fontFamily: "'Segoe UI', Arial, sans-serif",
-      wordWrap: { width: (IS_MOBILE ? screenW / MOBILE_ZOOM - 20 * DPR : 1200 * DPR) },
+      wordWrap: { width: (IS_MOBILE ? screenW - 20 * DPR : 1200 * DPR) },
     }).setOrigin(0.5, 0).setDepth(4);
     if (IS_MOBILE) this.infoText.setScrollFactor(0);
 
     // Stats display (bottom-right)
-    const statsSize = IS_MOBILE ? Math.round(11 * DPR) : Math.round(14 * DPR);
-    const statsY = IS_MOBILE ? (screenH / MOBILE_ZOOM - 6 * DPR) : 708 * DPR;
-    const statsX = IS_MOBILE ? (screenW / MOBILE_ZOOM - 10 * DPR) : 1270 * DPR;
+    const statsSize = IS_MOBILE ? Math.round(13 * DPR) : Math.round(14 * DPR);
+    const statsY = IS_MOBILE ? screenH - 6 * DPR : 708 * DPR;
+    const statsX = IS_MOBILE ? screenW - 10 * DPR : 1270 * DPR;
     this.statsText = this.add.text(statsX, statsY, "", {
       fontSize: `${statsSize}px`,
       color: "#d1d5db",
@@ -207,7 +209,7 @@ export class MapScene extends Phaser.Scene {
     if (IS_MOBILE) this.statsText.setScrollFactor(0);
 
     // Mode toggle button (bottom-left)
-    const modeSize = IS_MOBILE ? Math.round(12 * DPR) : Math.round(14 * DPR);
+    const modeSize = Math.round(14 * DPR);
     const modeLabel = IS_MOBILE ? "Build" : "[R] Build Rails";
     this.modeText = this.add.text(10 * DPR, statsY, modeLabel, {
       fontSize: `${modeSize}px`,
@@ -221,9 +223,9 @@ export class MapScene extends Phaser.Scene {
 
     this.modeText.on("pointerdown", () => this.toggleMode());
 
-    // Game event feed (fixed to viewport)
-    const feedY = IS_MOBILE ? (screenH / MOBILE_ZOOM - 50 * DPR) : (screenH - 50 * DPR);
-    const feedX = IS_MOBILE ? (screenW / (2 * MOBILE_ZOOM)) : (640 * DPR);
+    // Game event feed (fixed to viewport, above stats area)
+    const feedY = IS_MOBILE ? screenH - 50 * DPR : screenH - 50 * DPR;
+    const feedX = IS_MOBILE ? screenW / 2 : 640 * DPR;
     this.feedText = this.add.text(feedX, feedY, "", {
       fontSize: `${Math.round(11 * DPR)}px`,
       color: "#e2e8f0",
