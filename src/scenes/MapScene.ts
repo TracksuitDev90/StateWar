@@ -52,6 +52,11 @@ export class MapScene extends Phaser.Scene {
   private modeText!: Phaser.GameObjects.Text;
   private mode: InteractionMode = "select";
 
+  // Drag-to-move state
+  private dragSourceId: string | null = null;
+  private dragLineGfx!: Phaser.GameObjects.Graphics;
+  private isDragging = false;
+
   constructor() {
     super({ key: "MapScene" });
   }
@@ -75,6 +80,9 @@ export class MapScene extends Phaser.Scene {
     // Railway layer (drawn under states)
     this.railGfx = this.add.graphics().setDepth(0);
 
+    // Drag line layer (drawn above states)
+    this.dragLineGfx = this.add.graphics().setDepth(7);
+
     // Build visuals for each state
     for (const state of stateData) {
       const centroid = this.computeCentroid(state.polygons[0]);
@@ -94,7 +102,7 @@ export class MapScene extends Phaser.Scene {
         gfx.setInteractive(hitArea, Phaser.Geom.Polygon.Contains);
         gfx.on("pointerover", () => this.onHover(state.id, true));
         gfx.on("pointerout", () => this.onHover(state.id, false));
-        gfx.on("pointerdown", () => this.onClickState(state.id));
+        gfx.on("pointerdown", (pointer: Phaser.Input.Pointer) => this.onPointerDownState(state.id, pointer));
 
         gfxList.push(gfx);
       }
@@ -151,6 +159,30 @@ export class MapScene extends Phaser.Scene {
     this.input.on("pointerdown", (pointer: Phaser.Input.Pointer) => {
       if (pointer.rightButtonDown()) this.deselect();
     });
+
+    // Drag-to-move: draw line while dragging, resolve on release
+    this.input.on("pointermove", (pointer: Phaser.Input.Pointer) => {
+      if (!this.isDragging || !this.dragSourceId) return;
+      this.drawDragLine(pointer);
+    });
+
+    this.input.on("pointerup", (pointer: Phaser.Input.Pointer) => {
+      if (!this.isDragging || !this.dragSourceId) return;
+      this.dragLineGfx.clear();
+      // Find what state the pointer is over
+      const targetId = this.findStateAtPoint(pointer.x, pointer.y);
+      if (targetId && targetId !== this.dragSourceId) {
+        this.selectedStateId = this.dragSourceId;
+        if (this.isValidTarget(targetId)) {
+          this.executeMove(targetId);
+        } else {
+          this.deselect();
+        }
+      }
+      this.isDragging = false;
+      this.dragSourceId = null;
+    });
+
     if (this.input.keyboard) {
       this.input.keyboard.on("keydown-ESC", () => this.deselect());
       this.input.keyboard.on("keydown-R", () => this.toggleMode());
@@ -306,37 +338,34 @@ export class MapScene extends Phaser.Scene {
     }
   }
 
-  private onClickState(stateId: string): void {
+  private onPointerDownState(stateId: string, _pointer: Phaser.Input.Pointer): void {
     if (this.mode === "build") {
       this.onClickStateBuildMode(stateId);
       return;
     }
 
-    // Select mode
-    if (this.selectedStateId === null) {
-      if (this.gsm.getOwner(stateId) === "player") {
-        this.selectedStateId = stateId;
-        this.redrawAll();
-        const vis = this.visuals.get(stateId)!;
-        const units = this.gsm.getUnits(stateId);
-        this.infoText.setText(`${vis.data.name} selected (${units} units) — tap adjacent state`);
+    // If we already have a selected state and click a target, execute immediately (click flow)
+    if (this.selectedStateId !== null && stateId !== this.selectedStateId) {
+      if (this.isValidTarget(stateId)) {
+        this.executeMove(stateId);
+        return;
       }
+    }
+
+    // Start drag from an owned state
+    if (this.gsm.getOwner(stateId) === "player" && this.gsm.getUnits(stateId) > 1) {
+      this.dragSourceId = stateId;
+      this.isDragging = true;
+      this.selectedStateId = stateId;
+      this.redrawAll();
+      const vis = this.visuals.get(stateId)!;
+      const units = this.gsm.getUnits(stateId);
+      this.infoText.setText(`${vis.data.name} selected (${units} units) — drag to target or tap`);
       return;
     }
 
     if (stateId === this.selectedStateId) {
       this.deselect();
-      return;
-    }
-
-    if (this.isValidTarget(stateId)) {
-      this.executeMove(stateId);
-      return;
-    }
-
-    if (this.gsm.getOwner(stateId) === "player") {
-      this.selectedStateId = stateId;
-      this.redrawAll();
       return;
     }
 
@@ -411,7 +440,7 @@ export class MapScene extends Phaser.Scene {
         const result: CombatResult = this.gsm.resolveCombat(fromId, targetId, attackers, true);
         if (result.captured) {
           this.infoText.setText(
-            `Captured ${targetVis.data.name}! Lost ${result.attackerLost}, killed ${result.defenderLost}`
+            `${targetVis.data.name} neutralized! Lost ${result.attackerLost}, killed ${result.defenderLost} — claim it!`
           );
         } else {
           this.infoText.setText(
@@ -442,14 +471,14 @@ export class MapScene extends Phaser.Scene {
     const dx = tx - sx;
     const dy = ty - sy;
     const dist = Math.sqrt(dx * dx + dy * dy);
-    const duration = Math.max(300, Math.min(800, dist * 1.5)); // 300-800ms based on distance
+    const duration = Math.max(600, Math.min(1600, dist * 3)); // 600-1600ms — slower, more visible
 
-    // Create a cluster of small circles (up to 5 visual dots)
+    // Create a cluster of circles (up to 5 visual dots, larger)
     const dotCount = Math.min(count, 5);
     const dots: Phaser.GameObjects.Arc[] = [];
 
     for (let i = 0; i < dotCount; i++) {
-      const radius = Math.max(3, Math.min(6, 2 + count / 5)) * DPR;
+      const radius = Math.max(5, Math.min(10, 4 + count / 3)) * DPR;
       const dot = this.add.circle(sx, sy, radius, color, 0.9).setDepth(5);
       dots.push(dot);
     }
@@ -494,9 +523,96 @@ export class MapScene extends Phaser.Scene {
     });
   }
 
+  /** Draw drag indicator line from source state to pointer, snapping to target state if hovering one */
+  private drawDragLine(pointer: Phaser.Input.Pointer): void {
+    this.dragLineGfx.clear();
+    if (!this.dragSourceId) return;
+
+    const fromVis = this.visuals.get(this.dragSourceId);
+    if (!fromVis) return;
+
+    const sx = fromVis.centroid[0] * DPR;
+    const sy = fromVis.centroid[1] * DPR;
+    let ex = pointer.x;
+    let ey = pointer.y;
+
+    // Snap to target state centroid if hovering a valid target
+    const hoveredId = this.findStateAtPoint(pointer.x, pointer.y);
+    let isValid = false;
+    if (hoveredId && hoveredId !== this.dragSourceId) {
+      // Temporarily set selectedStateId for isValidTarget check
+      const prevSelected = this.selectedStateId;
+      this.selectedStateId = this.dragSourceId;
+      isValid = this.isValidTarget(hoveredId);
+      this.selectedStateId = prevSelected;
+
+      if (isValid) {
+        const toVis = this.visuals.get(hoveredId)!;
+        ex = toVis.centroid[0] * DPR;
+        ey = toVis.centroid[1] * DPR;
+      }
+    }
+
+    // Draw line: green if valid target, red/gray otherwise
+    const lineColor = isValid ? 0x22d3ee : 0x9ca3af;
+    const lineAlpha = isValid ? 0.9 : 0.5;
+    this.dragLineGfx.lineStyle(3 * DPR, lineColor, lineAlpha);
+    this.dragLineGfx.beginPath();
+    this.dragLineGfx.moveTo(sx, sy);
+    this.dragLineGfx.lineTo(ex, ey);
+    this.dragLineGfx.strokePath();
+
+    // Draw arrowhead at end
+    if (isValid) {
+      const angle = Math.atan2(ey - sy, ex - sx);
+      const arrowSize = 8 * DPR;
+      const ax1 = ex - arrowSize * Math.cos(angle - 0.4);
+      const ay1 = ey - arrowSize * Math.sin(angle - 0.4);
+      const ax2 = ex - arrowSize * Math.cos(angle + 0.4);
+      const ay2 = ey - arrowSize * Math.sin(angle + 0.4);
+      this.dragLineGfx.fillStyle(lineColor, lineAlpha);
+      this.dragLineGfx.fillTriangle(ex, ey, ax1, ay1, ax2, ay2);
+    }
+  }
+
+  /** Find which state the pointer is over using centroid proximity */
+  private findStateAtPoint(x: number, y: number): string | null {
+    let closest: string | null = null;
+    let closestDist = Infinity;
+
+    for (const [id, vis] of this.visuals) {
+      // Check polygon hit using Phaser's contains
+      for (let i = 0; i < vis.gfxList.length; i++) {
+        const polygon = vis.data.polygons[i];
+        if (!polygon || polygon.length < 3) continue;
+        const scaled = scaledPolygon(polygon);
+        const flatPoints: number[] = [];
+        for (const [px, py] of scaled) flatPoints.push(px, py);
+        const geom = new Phaser.Geom.Polygon(flatPoints);
+        if (Phaser.Geom.Polygon.Contains(geom, x, y)) {
+          return id;
+        }
+      }
+
+      // Fallback: track closest centroid within a reasonable radius
+      const cx = vis.centroid[0] * DPR;
+      const cy = vis.centroid[1] * DPR;
+      const dist = Math.sqrt((x - cx) ** 2 + (y - cy) ** 2);
+      if (dist < closestDist && dist < 30 * DPR) {
+        closestDist = dist;
+        closest = id;
+      }
+    }
+
+    return closest;
+  }
+
   private deselect(): void {
-    if (this.selectedStateId === null) return;
+    if (this.selectedStateId === null && !this.isDragging) return;
     this.selectedStateId = null;
+    this.isDragging = false;
+    this.dragSourceId = null;
+    this.dragLineGfx.clear();
     this.redrawAll();
     this.updateInfoDefault();
   }

@@ -100,7 +100,8 @@ export class GameStateManager {
     const remainingAttackers = attackers - attackerLost;
     const remainingDefenders = dst.units - defenderLost;
 
-    const captured = remainingDefenders <= 0;
+    const defendersEliminated = remainingDefenders <= 0;
+
 
     // Apply to game state
     if (!skipSourceDeduction) {
@@ -108,9 +109,11 @@ export class GameStateManager {
       this.emitMove({ from: fromId, to: toId, count: attackers, owner: src.owner });
     }
 
-    if (captured) {
-      dst.owner = src.owner;
-      dst.units = Math.max(1, remainingAttackers);
+    if (defendersEliminated) {
+      // All defenders defeated: state becomes neutral, not captured.
+      // Surviving attackers are spent (they don't move in).
+      dst.owner = "neutral";
+      dst.units = 1;
     } else {
       dst.units = Math.max(1, remainingDefenders);
     }
@@ -120,7 +123,7 @@ export class GameStateManager {
     return {
       attackerLost,
       defenderLost,
-      captured,
+      captured: defendersEliminated, // signals defenders were wiped, but state is now neutral
       remainingAttackers: Math.max(0, remainingAttackers),
       remainingDefenders: Math.max(0, remainingDefenders),
     };
@@ -138,16 +141,14 @@ export class GameStateManager {
     return this.hasRailway(fromId, toId, src.owner);
   }
 
-  /** Check if fromId can move units to toId (friendly) — includes railway links */
+  /** Check if fromId can move units to toId (friendly) — any owned state to any owned state */
   canMove(fromId: string, toId: string): boolean {
     const src = this.state[fromId];
     const dst = this.state[toId];
     if (!src || !dst) return false;
     if (src.owner !== dst.owner) return false;
     if (src.units <= 1) return false;
-    const neighbors = adjacencyGraph[fromId] ?? [];
-    if (neighbors.includes(toId)) return true;
-    return this.hasRailway(fromId, toId, src.owner);
+    return true;
   }
 
   // ── Railway methods ──
