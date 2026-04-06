@@ -30,3 +30,11 @@ export interface UnitMoveEvent {
 }
 
 export type MoveListener = (event: UnitMoveEvent) => void;
+
+export interface GameEvent {
+  message: string;
+  owner: Owner;
+  timestamp: number;
+}
+
+export type GameEventListener = (event: GameEvent) => void;

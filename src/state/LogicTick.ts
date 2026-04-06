@@ -6,7 +6,7 @@ import { stateBonuses } from "../data/stateBonuses";
 const TICK_INTERVAL_MS = 1000;
 const BASE_GEN_PER_STATE = 0.15;
 const GEN_CAP = 99;
-const AI_TICK_INTERVAL = 3; // AI acts every 3 ticks (3 seconds)
+const AI_TICK_INTERVAL = 5; // AI acts every 5 ticks (5 seconds) — slower, more balanced
 
 export type TickCallback = () => void;
 
@@ -51,8 +51,9 @@ export class LogicTick {
       const bonus = stateBonuses[id]?.genBonus ?? 0;
       let genRate = BASE_GEN_PER_STATE + bonus;
 
-      // Apply rubber-band bonus to AI states
+      // AI generates slightly slower to give player an advantage
       if (territory.owner === "ai") {
+        genRate *= 0.85;
         genRate += this.ai.rubberBandBonus;
       }
 
@@ -78,7 +79,10 @@ export class LogicTick {
     if (!territory || territory.owner === "neutral") return 0;
     const bonus = stateBonuses[stateId]?.genBonus ?? 0;
     let rate = BASE_GEN_PER_STATE + bonus;
-    if (territory.owner === "ai") rate += this.ai.rubberBandBonus;
+    if (territory.owner === "ai") {
+      rate *= 0.85;
+      rate += this.ai.rubberBandBonus;
+    }
     return rate;
   }
 

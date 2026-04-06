@@ -3,7 +3,7 @@ import { stateData, StateData } from "../data/states";
 import { stateBonuses } from "../data/stateBonuses";
 import { GameStateManager } from "../state/GameStateManager";
 import { LogicTick } from "../state/LogicTick";
-import { Owner, CombatResult, UnitMoveEvent } from "../types";
+import { Owner, CombatResult, UnitMoveEvent, GameEvent } from "../types";
 
 const DPR = Math.min(window.devicePixelRatio || 1, 2);
 const IS_MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
@@ -34,6 +34,15 @@ const WALL_L2_COLOR_OUTER = 0x4a4a5a;  // dark fortress outer
 const WALL_L2_COLOR_INNER = 0x6a6a7a;  // lighter fortress inner
 const WALL_L2_COLOR_TOP   = 0x8a8a9a;  // top highlight for 2.5D
 const DOUBLE_TAP_MS = 400; // max ms between taps for double-tap
+
+// Mobile camera zoom
+const MOBILE_ZOOM = 1.8;
+const MOBILE_MIN_ZOOM = 1.2;
+const MOBILE_MAX_ZOOM = 3.0;
+
+// Game event feed
+const MAX_FEED_EVENTS = 5;
+const FEED_FADE_MS = 6000; // events fade after 6 seconds
 
 interface StateVisual {
   data: StateData;
@@ -71,12 +80,38 @@ export class MapScene extends Phaser.Scene {
   private lastTapStateId: string | null = null;
   private lastTapTime = 0;
 
+  // Mobile camera panning
+  private isPanning = false;
+  private panStartX = 0;
+  private panStartY = 0;
+  private camStartScrollX = 0;
+  private camStartScrollY = 0;
+  private stateWasHit = false;
+
+  // Pinch-to-zoom
+  private pinchStartDist = 0;
+  private pinchStartZoom = 1;
+
+  // Game event feed
+  private feedEvents: { message: string; owner: Owner; time: number }[] = [];
+  private feedText!: Phaser.GameObjects.Text;
+
   constructor() {
     super({ key: "MapScene" });
   }
 
   create(): void {
     this.cameras.main.setBackgroundColor(0x111827);
+
+    // On mobile, zoom in for a detailed, cropped view
+    if (IS_MOBILE) {
+      const cam = this.cameras.main;
+      cam.setBounds(0, 0, 1280 * DPR, 720 * DPR);
+      cam.setZoom(MOBILE_ZOOM);
+      // Center on the middle of the map initially
+      cam.centerOn(640 * DPR, 360 * DPR);
+    }
+
     this.gsm = new GameStateManager();
 
     // Listen for AI/consolidation move events and animate them
@@ -145,25 +180,31 @@ export class MapScene extends Phaser.Scene {
       this.visuals.set(state.id, { data: state, gfxList, label, unitText, centroid });
     }
 
-    // Info bar
+    // Info bar — fixed to viewport on mobile
     const infoSize = IS_MOBILE ? Math.round(13 * DPR) : Math.round(18 * DPR);
     const infoY = IS_MOBILE ? 6 * DPR : 14 * DPR;
-    this.infoText = this.add.text(640 * DPR, infoY, "Select one of your states (blue)", {
+    const screenW = Number(this.game.config.width);
+    const screenH = Number(this.game.config.height);
+    const infoCx = IS_MOBILE ? screenW / (2 * MOBILE_ZOOM) : 640 * DPR;
+    this.infoText = this.add.text(infoCx, infoY, "Select one of your states (blue)", {
       fontSize: `${infoSize}px`,
       color: "#ffffff",
       fontFamily: "'Segoe UI', Arial, sans-serif",
-      wordWrap: { width: 1200 * DPR },
+      wordWrap: { width: (IS_MOBILE ? screenW / MOBILE_ZOOM - 20 * DPR : 1200 * DPR) },
     }).setOrigin(0.5, 0).setDepth(4);
+    if (IS_MOBILE) this.infoText.setScrollFactor(0);
 
     // Stats display (bottom-right)
     const statsSize = IS_MOBILE ? Math.round(11 * DPR) : Math.round(14 * DPR);
-    const statsY = IS_MOBILE ? 714 * DPR : 708 * DPR;
-    this.statsText = this.add.text(1270 * DPR, statsY, "", {
+    const statsY = IS_MOBILE ? (screenH / MOBILE_ZOOM - 6 * DPR) : 708 * DPR;
+    const statsX = IS_MOBILE ? (screenW / MOBILE_ZOOM - 10 * DPR) : 1270 * DPR;
+    this.statsText = this.add.text(statsX, statsY, "", {
       fontSize: `${statsSize}px`,
       color: "#d1d5db",
       fontFamily: "'Segoe UI', Arial, sans-serif",
       align: "right",
     }).setOrigin(1, 1).setDepth(4);
+    if (IS_MOBILE) this.statsText.setScrollFactor(0);
 
     // Mode toggle button (bottom-left)
     const modeSize = IS_MOBILE ? Math.round(12 * DPR) : Math.round(14 * DPR);
@@ -176,25 +217,87 @@ export class MapScene extends Phaser.Scene {
       backgroundColor: "#1f2937",
       padding: { x: 8 * DPR, y: 5 * DPR },
     }).setOrigin(0, 1).setDepth(4).setInteractive({ useHandCursor: true });
+    if (IS_MOBILE) this.modeText.setScrollFactor(0);
 
     this.modeText.on("pointerdown", () => this.toggleMode());
 
+    // Game event feed (fixed to viewport)
+    const feedY = IS_MOBILE ? (screenH / MOBILE_ZOOM - 50 * DPR) : (screenH - 50 * DPR);
+    const feedX = IS_MOBILE ? (screenW / (2 * MOBILE_ZOOM)) : (640 * DPR);
+    this.feedText = this.add.text(feedX, feedY, "", {
+      fontSize: `${Math.round(11 * DPR)}px`,
+      color: "#e2e8f0",
+      fontFamily: "'Segoe UI', Arial, sans-serif",
+      align: "center",
+      lineSpacing: 4 * DPR,
+      stroke: "#000000",
+      strokeThickness: 2 * DPR,
+    }).setOrigin(0.5, 1).setDepth(10).setAlpha(0.85);
+    if (IS_MOBILE) this.feedText.setScrollFactor(0);
+
+    // Listen for game events (AI combat, fortify, etc.)
+    this.gsm.onGameEvent((event: GameEvent) => {
+      this.addFeedEvent(event.message, event.owner);
+    });
+
     // Right-click or Escape to deselect
     this.input.on("pointerdown", (pointer: Phaser.Input.Pointer) => {
-      if (pointer.rightButtonDown()) this.deselect();
+      if (pointer.rightButtonDown()) { this.deselect(); return; }
+
+      // Mobile camera panning: if no state was hit, start pan
+      if (IS_MOBILE && !this.stateWasHit) {
+        this.isPanning = true;
+        this.panStartX = pointer.x;
+        this.panStartY = pointer.y;
+        this.camStartScrollX = this.cameras.main.scrollX;
+        this.camStartScrollY = this.cameras.main.scrollY;
+      }
+      this.stateWasHit = false;
     });
 
     // Drag-to-move: draw line while dragging, resolve on release
     this.input.on("pointermove", (pointer: Phaser.Input.Pointer) => {
+      // Pinch-to-zoom (two-finger gesture) on mobile
+      if (IS_MOBILE && this.input.pointer1.isDown && this.input.pointer2.isDown) {
+        this.isPanning = false;
+        const p1 = this.input.pointer1;
+        const p2 = this.input.pointer2;
+        const dist = Math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2);
+        if (this.pinchStartDist === 0) {
+          this.pinchStartDist = dist;
+          this.pinchStartZoom = this.cameras.main.zoom;
+        } else {
+          const scale = dist / this.pinchStartDist;
+          const newZoom = Phaser.Math.Clamp(this.pinchStartZoom * scale, MOBILE_MIN_ZOOM, MOBILE_MAX_ZOOM);
+          this.cameras.main.setZoom(newZoom);
+        }
+        return;
+      }
+
+      // Camera panning on mobile
+      if (this.isPanning && IS_MOBILE) {
+        const dx = pointer.x - this.panStartX;
+        const dy = pointer.y - this.panStartY;
+        const zoom = this.cameras.main.zoom;
+        this.cameras.main.scrollX = this.camStartScrollX - dx / zoom;
+        this.cameras.main.scrollY = this.camStartScrollY - dy / zoom;
+        return;
+      }
+
       if (!this.isDragging || !this.dragSourceId) return;
       this.drawDragLine(pointer);
     });
 
-    this.input.on("pointerup", (pointer: Phaser.Input.Pointer) => {
+    this.input.on("pointerup", (_pointer: Phaser.Input.Pointer) => {
+      this.isPanning = false;
+      this.pinchStartDist = 0;
+
       if (!this.isDragging || !this.dragSourceId) return;
       this.dragLineGfx.clear();
-      // Find what state the pointer is over
-      const targetId = this.findStateAtPoint(pointer.x, pointer.y);
+      // Find what state the pointer is over — use world coordinates
+      const wx = _pointer.worldX;
+      const wy = _pointer.worldY;
+      const targetId = this.findStateAtPoint(wx, wy);
       if (targetId && targetId !== this.dragSourceId) {
         this.selectedStateId = this.dragSourceId;
         if (this.isValidTarget(targetId)) {
@@ -216,6 +319,7 @@ export class MapScene extends Phaser.Scene {
     this.logicTick = new LogicTick(this.gsm, () => {
       this.redrawAll();
       this.updateStats();
+      this.updateFeed();
     });
     this.logicTick.start();
 
@@ -493,6 +597,7 @@ export class MapScene extends Phaser.Scene {
   }
 
   private onPointerDownState(stateId: string, _pointer: Phaser.Input.Pointer): void {
+    this.stateWasHit = true; // prevent camera pan when tapping a state
     if (this.mode === "build") {
       this.onClickStateBuildMode(stateId);
       return;
@@ -721,11 +826,11 @@ export class MapScene extends Phaser.Scene {
 
     const sx = fromVis.centroid[0] * DPR;
     const sy = fromVis.centroid[1] * DPR;
-    let ex = pointer.x;
-    let ey = pointer.y;
+    let ex = pointer.worldX;
+    let ey = pointer.worldY;
 
     // Snap to target state centroid if hovering a valid target
-    const hoveredId = this.findStateAtPoint(pointer.x, pointer.y);
+    const hoveredId = this.findStateAtPoint(pointer.worldX, pointer.worldY);
     let isValid = false;
     if (hoveredId && hoveredId !== this.dragSourceId) {
       // Temporarily set selectedStateId for isValidTarget check
@@ -741,10 +846,10 @@ export class MapScene extends Phaser.Scene {
       }
     }
 
-    // Draw line: green if valid target, red/gray otherwise
+    // Draw line: cyan if valid target, gray otherwise
     const lineColor = isValid ? 0x22d3ee : 0x9ca3af;
     const lineAlpha = isValid ? 0.9 : 0.5;
-    this.dragLineGfx.lineStyle(3 * DPR, lineColor, lineAlpha);
+    this.dragLineGfx.lineStyle(6 * DPR, lineColor, lineAlpha);
     this.dragLineGfx.beginPath();
     this.dragLineGfx.moveTo(sx, sy);
     this.dragLineGfx.lineTo(ex, ey);
@@ -753,7 +858,7 @@ export class MapScene extends Phaser.Scene {
     // Draw arrowhead at end
     if (isValid) {
       const angle = Math.atan2(ey - sy, ex - sx);
-      const arrowSize = 8 * DPR;
+      const arrowSize = 12 * DPR;
       const ax1 = ex - arrowSize * Math.cos(angle - 0.4);
       const ay1 = ey - arrowSize * Math.sin(angle - 0.4);
       const ax2 = ex - arrowSize * Math.cos(angle + 0.4);
@@ -827,6 +932,31 @@ export class MapScene extends Phaser.Scene {
     this.statsText.setText(
       `You: ${pStates} states, ${pUnits} units  |  AI: ${aStates} states, ${aUnits} units${railStr}`
     );
+  }
+
+  // ── Game Event Feed ──
+
+  private addFeedEvent(message: string, owner: Owner): void {
+    this.feedEvents.push({ message, owner, time: Date.now() });
+    if (this.feedEvents.length > MAX_FEED_EVENTS) {
+      this.feedEvents.shift();
+    }
+    this.updateFeed();
+  }
+
+  private updateFeed(): void {
+    const now = Date.now();
+    // Remove stale events
+    this.feedEvents = this.feedEvents.filter(e => now - e.time < FEED_FADE_MS);
+    if (this.feedEvents.length === 0) {
+      this.feedText.setText("");
+      return;
+    }
+    const lines = this.feedEvents.map(e => {
+      const color = e.owner === "player" ? "🔵" : e.owner === "ai" ? "🔴" : "⚪";
+      return `${color} ${e.message}`;
+    });
+    this.feedText.setText(lines.join("\n"));
   }
 
   shutdown(): void {

@@ -15,14 +15,14 @@ import { stateBonuses } from "../data/stateBonuses";
 const AI_OWNER = "ai" as const;
 const PLAYER_OWNER = "player" as const;
 
-const ATTACK_THRESHOLD = 1.8;    // attack if we have 1.8× the effective defense
-const CONSOLIDATE_THRESHOLD = 8; // interior states above this send units forward
-const RAIL_BUILD_THRESHOLD = 15; // only build rails when source state has 15+ units
-const WALL_BUILD_THRESHOLD = 20; // fortify borders when 20+ units
+const ATTACK_THRESHOLD = 2.5;    // attack if we have 2.5× the effective defense (more cautious)
+const CONSOLIDATE_THRESHOLD = 12; // interior states above this send units forward (slower consolidation)
+const RAIL_BUILD_THRESHOLD = 20; // only build rails when source state has 20+ units
+const WALL_BUILD_THRESHOLD = 25; // fortify borders when 25+ units
 
-// Rubber-banding
-const RUBBERBAND_CHECK_INTERVAL = 10; // check every 10 ticks
-const RUBBERBAND_MAX_BONUS = 0.3;     // max extra gen per state per tick
+// Rubber-banding (reduced)
+const RUBBERBAND_CHECK_INTERVAL = 15; // check less frequently
+const RUBBERBAND_MAX_BONUS = 0.15;    // halved max extra gen per state per tick
 
 export class AIController {
   private gsm: GameStateManager;
