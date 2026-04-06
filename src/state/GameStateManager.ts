@@ -138,16 +138,14 @@ export class GameStateManager {
     return this.hasRailway(fromId, toId, src.owner);
   }
 
-  /** Check if fromId can move units to toId (friendly) — includes railway links */
+  /** Check if fromId can move units to toId (friendly) — any owned state to any owned state */
   canMove(fromId: string, toId: string): boolean {
     const src = this.state[fromId];
     const dst = this.state[toId];
     if (!src || !dst) return false;
     if (src.owner !== dst.owner) return false;
     if (src.units <= 1) return false;
-    const neighbors = adjacencyGraph[fromId] ?? [];
-    if (neighbors.includes(toId)) return true;
-    return this.hasRailway(fromId, toId, src.owner);
+    return true;
   }
 
   // ── Railway methods ──
