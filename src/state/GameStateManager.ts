@@ -1,4 +1,4 @@
-import { GameState, Owner, CombatResult, RailwayState, MoveListener, UnitMoveEvent } from "../types";
+import { GameState, Owner, CombatResult, RailwayState, MoveListener, UnitMoveEvent, GameEvent, GameEventListener } from "../types";
 import { stateData } from "../data/states";
 import { adjacencyGraph } from "../data/adjacency";
 import { stateDefenseBonus } from "../data/stateDefense";
@@ -15,17 +15,31 @@ const WALL_LEVEL1_MAX = 50;
 const WALL_LEVEL2_MAX = 100;
 const WALL_ABSORB_RATIO = 3;     // 3 attackers consumed per 1 wall health
 
+// State name lookup
+const stateNameMap: Record<string, string> = {};
+for (const s of stateData) stateNameMap[s.id] = s.name;
+
 export class GameStateManager {
   public state: GameState = {};
   public railways: RailwayState[] = [];
   private moveListeners: MoveListener[] = [];
+  private gameEventListeners: GameEventListener[] = [];
 
   onMove(listener: MoveListener): void {
     this.moveListeners.push(listener);
   }
 
+  onGameEvent(listener: GameEventListener): void {
+    this.gameEventListeners.push(listener);
+  }
+
   private emitMove(event: UnitMoveEvent): void {
     for (const listener of this.moveListeners) listener(event);
+  }
+
+  emitGameEvent(message: string, owner: Owner): void {
+    const event: GameEvent = { message, owner, timestamp: Date.now() };
+    for (const listener of this.gameEventListeners) listener(event);
   }
 
   constructor() {
@@ -86,6 +100,9 @@ export class GameStateManager {
 
     t.units -= unitsConsumed;
     t.wallHealth += healthToAdd;
+
+    const name = stateNameMap[stateId] ?? stateId;
+    this.emitGameEvent(`${t.owner === "player" ? "You" : "AI"} fortified ${name}`, t.owner);
 
     return { added: healthToAdd, newHealth: t.wallHealth, level: this.getWallLevel(stateId) };
   }
@@ -195,6 +212,15 @@ export class GameStateManager {
     }
 
     if (src.units < 1) src.units = 1;
+
+    // Emit game event for the feed
+    const defenderName = stateNameMap[toId] ?? toId;
+    const who = src.owner === "player" ? "You" : "AI";
+    if (defendersEliminated) {
+      this.emitGameEvent(`${who} captured ${defenderName}`, src.owner);
+    } else {
+      this.emitGameEvent(`${who} attacked ${defenderName} — repelled`, src.owner);
+    }
 
     return {
       attackerLost,
