@@ -6,6 +6,8 @@ import { LogicTick } from "../state/LogicTick";
 import { Owner, CombatResult, UnitMoveEvent } from "../types";
 
 const DPR = Math.min(window.devicePixelRatio || 1, 2);
+const IS_MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
+  (window.innerWidth <= 900 && "ontouchstart" in window);
 
 // Owner-based colors
 const OWNER_COLORS: Record<Owner, number> = {
@@ -24,6 +26,14 @@ const SELECTED_BORDER_WIDTH = 3 * DPR;
 const RAIL_COLOR_PLAYER = 0x60a5fa; // blue tint for player rails
 const RAIL_COLOR_AI = 0xf87171;     // red tint for AI rails
 const RAIL_LINE_WIDTH = 2.5;
+
+// Wall visuals
+const WALL_L1_COLOR_OUTER = 0x8b7355;  // brown stone outer
+const WALL_L1_COLOR_INNER = 0xa0906a;  // lighter stone inner
+const WALL_L2_COLOR_OUTER = 0x4a4a5a;  // dark fortress outer
+const WALL_L2_COLOR_INNER = 0x6a6a7a;  // lighter fortress inner
+const WALL_L2_COLOR_TOP   = 0x8a8a9a;  // top highlight for 2.5D
+const DOUBLE_TAP_MS = 400; // max ms between taps for double-tap
 
 interface StateVisual {
   data: StateData;
@@ -56,6 +66,10 @@ export class MapScene extends Phaser.Scene {
   private dragSourceId: string | null = null;
   private dragLineGfx!: Phaser.GameObjects.Graphics;
   private isDragging = false;
+
+  // Double-tap detection for wall building
+  private lastTapStateId: string | null = null;
+  private lastTapTime = 0;
 
   constructor() {
     super({ key: "MapScene" });
@@ -107,8 +121,11 @@ export class MapScene extends Phaser.Scene {
         gfxList.push(gfx);
       }
 
-      const label = this.add.text(cx, cy - 10 * DPR, state.id, {
-        fontSize: `${Math.round(12 * DPR)}px`,
+      const labelSize = IS_MOBILE ? Math.round(10 * DPR) : Math.round(12 * DPR);
+      const unitSize = IS_MOBILE ? Math.round(11 * DPR) : Math.round(14 * DPR);
+
+      const label = this.add.text(cx, cy - 8 * DPR, state.id, {
+        fontSize: `${labelSize}px`,
         color: "#ffffff",
         fontFamily: "'Segoe UI', Arial, sans-serif",
         fontStyle: "bold",
@@ -116,8 +133,8 @@ export class MapScene extends Phaser.Scene {
         strokeThickness: 3 * DPR,
       }).setOrigin(0.5).setDepth(3);
 
-      const unitText = this.add.text(cx, cy + 8 * DPR, "", {
-        fontSize: `${Math.round(14 * DPR)}px`,
+      const unitText = this.add.text(cx, cy + 6 * DPR, "", {
+        fontSize: `${unitSize}px`,
         color: "#ffffff",
         fontFamily: "'Segoe UI', Arial, sans-serif",
         fontStyle: "bold",
@@ -129,28 +146,35 @@ export class MapScene extends Phaser.Scene {
     }
 
     // Info bar
-    this.infoText = this.add.text(640 * DPR, 14 * DPR, "Select one of your states (blue)", {
-      fontSize: `${Math.round(18 * DPR)}px`,
+    const infoSize = IS_MOBILE ? Math.round(13 * DPR) : Math.round(18 * DPR);
+    const infoY = IS_MOBILE ? 6 * DPR : 14 * DPR;
+    this.infoText = this.add.text(640 * DPR, infoY, "Select one of your states (blue)", {
+      fontSize: `${infoSize}px`,
       color: "#ffffff",
       fontFamily: "'Segoe UI', Arial, sans-serif",
+      wordWrap: { width: 1200 * DPR },
     }).setOrigin(0.5, 0).setDepth(4);
 
     // Stats display (bottom-right)
-    this.statsText = this.add.text(1270 * DPR, 708 * DPR, "", {
-      fontSize: `${Math.round(14 * DPR)}px`,
+    const statsSize = IS_MOBILE ? Math.round(11 * DPR) : Math.round(14 * DPR);
+    const statsY = IS_MOBILE ? 714 * DPR : 708 * DPR;
+    this.statsText = this.add.text(1270 * DPR, statsY, "", {
+      fontSize: `${statsSize}px`,
       color: "#d1d5db",
       fontFamily: "'Segoe UI', Arial, sans-serif",
       align: "right",
     }).setOrigin(1, 1).setDepth(4);
 
     // Mode toggle button (bottom-left)
-    this.modeText = this.add.text(10 * DPR, 708 * DPR, "[R] Build Rails", {
-      fontSize: `${Math.round(14 * DPR)}px`,
+    const modeSize = IS_MOBILE ? Math.round(12 * DPR) : Math.round(14 * DPR);
+    const modeLabel = IS_MOBILE ? "Build" : "[R] Build Rails";
+    this.modeText = this.add.text(10 * DPR, statsY, modeLabel, {
+      fontSize: `${modeSize}px`,
       color: "#fbbf24",
       fontFamily: "'Segoe UI', Arial, sans-serif",
       fontStyle: "bold",
       backgroundColor: "#1f2937",
-      padding: { x: 6 * DPR, y: 3 * DPR },
+      padding: { x: 8 * DPR, y: 5 * DPR },
     }).setOrigin(0, 1).setDepth(4).setInteractive({ useHandCursor: true });
 
     this.modeText.on("pointerdown", () => this.toggleMode());
@@ -204,7 +228,11 @@ export class MapScene extends Phaser.Scene {
   private toggleMode(): void {
     this.deselect();
     this.mode = this.mode === "select" ? "build" : "select";
-    this.modeText.setText(this.mode === "select" ? "[R] Build Rails" : "[R] Move Units");
+    if (IS_MOBILE) {
+      this.modeText.setText(this.mode === "select" ? "Build" : "Move");
+    } else {
+      this.modeText.setText(this.mode === "select" ? "[R] Build Rails" : "[R] Move Units");
+    }
     this.modeText.setColor(this.mode === "select" ? "#fbbf24" : "#22d3ee");
     this.updateInfoDefault();
     this.redrawAll();
@@ -253,6 +281,8 @@ export class MapScene extends Phaser.Scene {
   private redrawState(id: string, vis: StateVisual, hovered = false): void {
     const owner = this.gsm.getOwner(id);
     const units = this.gsm.getUnits(id);
+    const wallLevel = this.gsm.getWallLevel(id);
+    const wallHealth = this.gsm.getWallHealth(id);
     const isSelected = this.selectedStateId === id;
     const isValidTarget = this.selectedStateId !== null && this.isValidTarget(id);
 
@@ -272,10 +302,22 @@ export class MapScene extends Phaser.Scene {
 
     for (let i = 0; i < vis.gfxList.length; i++) {
       const polygon = vis.data.polygons[i];
-      if (polygon) this.drawPoly(vis.gfxList[i], scaledPolygon(polygon), fillColor, borderColor, borderWidth);
+      if (!polygon) continue;
+      const scaled = scaledPolygon(polygon);
+
+      if (wallLevel > 0) {
+        this.drawWalledPoly(vis.gfxList[i], scaled, fillColor, borderColor, borderWidth, wallLevel, wallHealth);
+      } else {
+        this.drawPoly(vis.gfxList[i], scaled, fillColor, borderColor, borderWidth);
+      }
     }
 
-    vis.unitText.setText(String(units));
+    // Show wall health in unit text if walls exist
+    if (wallLevel > 0) {
+      vis.unitText.setText(`${units} 🛡${wallHealth}`);
+    } else {
+      vis.unitText.setText(String(units));
+    }
   }
 
   private drawPoly(
@@ -294,6 +336,113 @@ export class MapScene extends Phaser.Scene {
     gfx.closePath();
     gfx.fillPath();
     gfx.strokePath();
+  }
+
+  /** Draw a state with 2.5D wall effect — multiple offset border layers */
+  private drawWalledPoly(
+    gfx: Phaser.GameObjects.Graphics,
+    polygon: [number, number][],
+    fill: number,
+    borderColor: number,
+    borderWidth: number,
+    wallLevel: number,
+    wallHealth: number,
+  ): void {
+    gfx.clear();
+
+    const isL2 = wallLevel >= 2;
+    const outerColor = isL2 ? WALL_L2_COLOR_OUTER : WALL_L1_COLOR_OUTER;
+    const innerColor = isL2 ? WALL_L2_COLOR_INNER : WALL_L1_COLOR_INNER;
+    const maxHealth = isL2 ? 100 : 50;
+    const healthPct = Math.min(1, wallHealth / maxHealth);
+
+    // Wall thickness scales with health percentage
+    const baseThick = isL2 ? 6 * DPR : 4 * DPR;
+    const wallThick = baseThick * healthPct;
+
+    // 2.5D effect: draw offset shadow layer (bottom-right shift)
+    const shadowOffset = isL2 ? 3 * DPR : 2 * DPR;
+    const shadowPoly: [number, number][] = polygon.map(([x, y]) => [x + shadowOffset, y + shadowOffset]);
+    gfx.fillStyle(0x222222, 0.4);
+    gfx.beginPath();
+    gfx.moveTo(shadowPoly[0][0], shadowPoly[0][1]);
+    for (let i = 1; i < shadowPoly.length; i++) gfx.lineTo(shadowPoly[i][0], shadowPoly[i][1]);
+    gfx.closePath();
+    gfx.fillPath();
+
+    // Outer wall border (dark)
+    gfx.lineStyle(wallThick + borderWidth + 2 * DPR, outerColor, 1);
+    gfx.beginPath();
+    gfx.moveTo(polygon[0][0], polygon[0][1]);
+    for (let i = 1; i < polygon.length; i++) gfx.lineTo(polygon[i][0], polygon[i][1]);
+    gfx.closePath();
+    gfx.strokePath();
+
+    // Inner wall highlight (lighter, creates depth)
+    gfx.lineStyle(wallThick + borderWidth, innerColor, 0.8);
+    gfx.beginPath();
+    gfx.moveTo(polygon[0][0], polygon[0][1]);
+    for (let i = 1; i < polygon.length; i++) gfx.lineTo(polygon[i][0], polygon[i][1]);
+    gfx.closePath();
+    gfx.strokePath();
+
+    // Level 2: top highlight edge for extra depth
+    if (isL2) {
+      gfx.lineStyle(wallThick * 0.4, WALL_L2_COLOR_TOP, 0.6);
+      gfx.beginPath();
+      gfx.moveTo(polygon[0][0], polygon[0][1]);
+      for (let i = 1; i < polygon.length; i++) gfx.lineTo(polygon[i][0], polygon[i][1]);
+      gfx.closePath();
+      gfx.strokePath();
+    }
+
+    // Fill the state
+    gfx.fillStyle(fill, 1);
+    gfx.beginPath();
+    gfx.moveTo(polygon[0][0], polygon[0][1]);
+    for (let i = 1; i < polygon.length; i++) gfx.lineTo(polygon[i][0], polygon[i][1]);
+    gfx.closePath();
+    gfx.fillPath();
+
+    // Normal border on top
+    gfx.lineStyle(borderWidth, borderColor, 1);
+    gfx.beginPath();
+    gfx.moveTo(polygon[0][0], polygon[0][1]);
+    for (let i = 1; i < polygon.length; i++) gfx.lineTo(polygon[i][0], polygon[i][1]);
+    gfx.closePath();
+    gfx.strokePath();
+
+    // Battlements for level 2: small notches along the border
+    if (isL2 && healthPct > 0.3) {
+      this.drawBattlements(gfx, polygon, outerColor);
+    }
+  }
+
+  /** Draw small battlement notches along polygon edges for fortress look */
+  private drawBattlements(gfx: Phaser.GameObjects.Graphics, polygon: [number, number][], color: number): void {
+    const notchSize = 3 * DPR;
+    const spacing = 20 * DPR;
+
+    gfx.fillStyle(color, 0.8);
+    for (let i = 0; i < polygon.length; i++) {
+      const [x1, y1] = polygon[i];
+      const [x2, y2] = polygon[(i + 1) % polygon.length];
+      const dx = x2 - x1;
+      const dy = y2 - y1;
+      const len = Math.sqrt(dx * dx + dy * dy);
+      if (len < spacing) continue;
+
+      const nx = -dy / len; // normal direction (outward)
+      const ny = dx / len;
+      const count = Math.floor(len / spacing);
+
+      for (let j = 1; j <= count; j++) {
+        const t = j / (count + 1);
+        const px = x1 + dx * t + nx * notchSize;
+        const py = y1 + dy * t + ny * notchSize;
+        gfx.fillRect(px - notchSize * 0.5, py - notchSize * 0.5, notchSize, notchSize);
+      }
+    }
   }
 
   // ── Interaction ──
@@ -332,7 +481,12 @@ export class MapScene extends Phaser.Scene {
         ? ` | ${rails.length} rail${rails.length > 1 ? "s" : ""}`
         : "";
 
-      this.infoText.setText(`${vis.data.name} | ${owner} | ${units} units${defStr}${genStr}${bonusStr}${railStr}`);
+      // Show wall info
+      const wallLevel = this.gsm.getWallLevel(stateId);
+      const wallHealth = this.gsm.getWallHealth(stateId);
+      const wallStr = wallLevel > 0 ? ` | Wall L${wallLevel} (${wallHealth}hp)` : "";
+
+      this.infoText.setText(`${vis.data.name} | ${owner} | ${units} units${defStr}${genStr}${bonusStr}${railStr}${wallStr}`);
     } else {
       this.updateInfoDefault();
     }
@@ -343,6 +497,22 @@ export class MapScene extends Phaser.Scene {
       this.onClickStateBuildMode(stateId);
       return;
     }
+
+    // Double-tap detection: fortify walls
+    const now = Date.now();
+    if (
+      this.lastTapStateId === stateId &&
+      now - this.lastTapTime < DOUBLE_TAP_MS &&
+      this.gsm.getOwner(stateId) === "player" &&
+      this.gsm.getUnits(stateId) > 1
+    ) {
+      this.lastTapStateId = null;
+      this.lastTapTime = 0;
+      this.fortifyState(stateId);
+      return;
+    }
+    this.lastTapStateId = stateId;
+    this.lastTapTime = now;
 
     // If we already have a selected state and click a target, execute immediately (click flow)
     if (this.selectedStateId !== null && stateId !== this.selectedStateId) {
@@ -360,7 +530,8 @@ export class MapScene extends Phaser.Scene {
       this.redrawAll();
       const vis = this.visuals.get(stateId)!;
       const units = this.gsm.getUnits(stateId);
-      this.infoText.setText(`${vis.data.name} selected (${units} units) — drag to target or tap`);
+      const fortifyHint = IS_MOBILE ? " | double-tap to fortify" : " | double-click to fortify";
+      this.infoText.setText(`${vis.data.name} selected (${units} units) — drag to target${fortifyHint}`);
       return;
     }
 
@@ -370,6 +541,23 @@ export class MapScene extends Phaser.Scene {
     }
 
     this.deselect();
+  }
+
+  private fortifyState(stateId: string): void {
+    const vis = this.visuals.get(stateId);
+    if (!vis) return;
+
+    const result = this.gsm.fortifyWall(stateId);
+    if (result.added > 0) {
+      const levelStr = result.level === 2 ? "Level 2" : "Level 1";
+      this.infoText.setText(
+        `${vis.data.name} fortified! +${result.added} wall HP (${result.newHealth} total, ${levelStr})`
+      );
+    } else {
+      this.infoText.setText(`${vis.data.name} — walls at max or no units to spare`);
+    }
+    this.deselect();
+    this.redrawAll();
   }
 
   private onClickStateBuildMode(stateId: string): void {
@@ -437,15 +625,10 @@ export class MapScene extends Phaser.Scene {
         this.infoText.setText(`Moved ${attackers} units to ${targetVis.data.name}`);
       } else {
         // Combat — resolve on arrival
-        const wasNeutral = toOwner === "neutral";
         const result: CombatResult = this.gsm.resolveCombat(fromId, targetId, attackers, true);
-        if (result.captured && wasNeutral) {
+        if (result.captured) {
           this.infoText.setText(
             `Claimed ${targetVis.data.name}! Lost ${result.attackerLost}, ${result.remainingAttackers} units garrison`
-          );
-        } else if (result.captured) {
-          this.infoText.setText(
-            `${targetVis.data.name} neutralized! Lost ${result.attackerLost}, killed ${result.defenderLost} — claim it!`
           );
         } else {
           this.infoText.setText(
@@ -603,7 +786,8 @@ export class MapScene extends Phaser.Scene {
       const cx = vis.centroid[0] * DPR;
       const cy = vis.centroid[1] * DPR;
       const dist = Math.sqrt((x - cx) ** 2 + (y - cy) ** 2);
-      if (dist < closestDist && dist < 30 * DPR) {
+      const hitRadius = IS_MOBILE ? 45 * DPR : 30 * DPR;
+      if (dist < closestDist && dist < hitRadius) {
         closestDist = dist;
         closest = id;
       }
@@ -629,7 +813,7 @@ export class MapScene extends Phaser.Scene {
       const vis = this.visuals.get(this.selectedStateId)!;
       this.infoText.setText(`${vis.data.name} selected — tap adjacent state`);
     } else {
-      this.infoText.setText("Select one of your states (blue)");
+      this.infoText.setText("Select a state (blue) — double-tap to fortify");
     }
   }
 

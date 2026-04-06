@@ -3,6 +3,7 @@ export type Owner = "player" | "ai" | "neutral";
 export interface TerritoryState {
   owner: Owner;
   units: number;
+  wallHealth: number;  // 0 = no wall, 1-50 = level 1, 51-100 = level 2
 }
 
 export type GameState = Record<string, TerritoryState>;

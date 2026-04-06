@@ -18,6 +18,7 @@ const PLAYER_OWNER = "player" as const;
 const ATTACK_THRESHOLD = 1.8;    // attack if we have 1.8× the effective defense
 const CONSOLIDATE_THRESHOLD = 8; // interior states above this send units forward
 const RAIL_BUILD_THRESHOLD = 15; // only build rails when source state has 15+ units
+const WALL_BUILD_THRESHOLD = 20; // fortify borders when 20+ units
 
 // Rubber-banding
 const RUBBERBAND_CHECK_INTERVAL = 10; // check every 10 ticks
@@ -49,7 +50,10 @@ export class AIController {
     // Phase 2: Consolidate interior units toward borders
     this.phaseConsolidate(aiStates);
 
-    // Phase 3: Build railways if we have spare units
+    // Phase 3: Fortify border states with walls
+    this.phaseFortify(aiStates);
+
+    // Phase 4: Build railways if we have spare units
     this.phaseBuildRails(aiStates);
   }
 
@@ -68,10 +72,13 @@ export class AIController {
         const defUnits = this.gsm.getUnits(target);
         const defBonus = this.gsm.getDefenseBonus(target);
         const effectiveDef = Math.floor(defUnits * defBonus);
+        const wallHealth = this.gsm.getWallHealth(target);
         const attackers = units - 1;
 
-        // Only attack if we have a clear advantage
-        if (attackers < effectiveDef * ATTACK_THRESHOLD) continue;
+        // Account for wall: need 3 attackers per wall health, plus enough to beat defenders
+        const wallCost = wallHealth * 3;
+        const effectiveNeeded = effectiveDef * ATTACK_THRESHOLD + wallCost;
+        if (attackers < effectiveNeeded) continue;
 
         // Score: prefer weaker targets, bonus states, and enemy states over neutral
         let score = attackers / Math.max(1, effectiveDef);
@@ -134,6 +141,29 @@ export class AIController {
           this.gsm.moveUnits(stateId, weakestBorder, moveCount);
         }
       }
+    }
+  }
+
+  // ── Fortify Phase ──
+
+  private phaseFortify(aiStates: string[]): void {
+    // Fortify border states that have enough units and face player threats
+    for (const stateId of aiStates) {
+      const units = this.gsm.getUnits(stateId);
+      if (units < WALL_BUILD_THRESHOLD) continue;
+      if (!this.isBorderState(stateId)) continue;
+
+      // Only fortify if facing player-owned neighbors
+      const neighbors = adjacencyGraph[stateId] ?? [];
+      const facesPlayer = neighbors.some(n => this.gsm.getOwner(n) === PLAYER_OWNER);
+      if (!facesPlayer) continue;
+
+      // Don't over-fortify — only if wall level < 2
+      const wallLevel = this.gsm.getWallLevel(stateId);
+      if (wallLevel >= 2) continue;
+
+      this.gsm.fortifyWall(stateId);
+      return; // one fortification per tick
     }
   }
 
