@@ -84,6 +84,7 @@ export class GameStateManager {
     const dst = this.state[toId];
     const defBonus = this.getDefenseBonus(toId);
     const effectiveDefense = Math.floor(dst.units * defBonus);
+    const isNeutralTarget = dst.owner === "neutral";
 
     // Power: how many casualties each side inflicts
     const attackPower = attackers * 0.6;
@@ -102,7 +103,6 @@ export class GameStateManager {
 
     const defendersEliminated = remainingDefenders <= 0;
 
-
     // Apply to game state
     if (!skipSourceDeduction) {
       src.units -= attackers;
@@ -110,10 +110,15 @@ export class GameStateManager {
     }
 
     if (defendersEliminated) {
-      // All defenders defeated: state becomes neutral, not captured.
-      // Surviving attackers are spent (they don't move in).
-      dst.owner = "neutral";
-      dst.units = 1;
+      if (isNeutralTarget) {
+        // Neutral states are claimed directly — surviving attackers move in
+        dst.owner = src.owner;
+        dst.units = Math.max(1, remainingAttackers);
+      } else {
+        // Player vs AI: state becomes neutral, must be reclaimed
+        dst.owner = "neutral";
+        dst.units = 1;
+      }
     } else {
       dst.units = Math.max(1, remainingDefenders);
     }
@@ -123,7 +128,7 @@ export class GameStateManager {
     return {
       attackerLost,
       defenderLost,
-      captured: defendersEliminated, // signals defenders were wiped, but state is now neutral
+      captured: defendersEliminated,
       remainingAttackers: Math.max(0, remainingAttackers),
       remainingDefenders: Math.max(0, remainingDefenders),
     };
