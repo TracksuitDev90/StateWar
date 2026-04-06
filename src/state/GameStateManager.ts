@@ -9,6 +9,12 @@ const AI_START = ["NY"];
 const STARTING_UNITS = 10;
 const NEUTRAL_UNITS = 5;
 
+// Wall constants
+const WALL_UNITS_PER_HEALTH = 1;  // 1 unit absorbed = 1 wall health
+const WALL_LEVEL1_MAX = 50;
+const WALL_LEVEL2_MAX = 100;
+const WALL_ABSORB_RATIO = 3;     // 3 attackers consumed per 1 wall health
+
 export class GameStateManager {
   public state: GameState = {};
   public railways: RailwayState[] = [];
@@ -35,7 +41,7 @@ export class GameStateManager {
         units = STARTING_UNITS;
       }
 
-      this.state[s.id] = { owner, units };
+      this.state[s.id] = { owner, units, wallHealth: 0 };
     }
   }
 
@@ -65,6 +71,42 @@ export class GameStateManager {
     return true;
   }
 
+  /** Absorb units into wall defense. Returns amount of health added. */
+  fortifyWall(stateId: string): { added: number; newHealth: number; level: number } {
+    const t = this.state[stateId];
+    if (!t) return { added: 0, newHealth: 0, level: 0 };
+
+    const maxHealth = WALL_LEVEL2_MAX;
+    const available = t.units - 1; // keep at least 1
+    if (available <= 0) return { added: 0, newHealth: t.wallHealth, level: this.getWallLevel(stateId) };
+
+    const room = maxHealth - t.wallHealth;
+    const healthToAdd = Math.min(available * WALL_UNITS_PER_HEALTH, room);
+    const unitsConsumed = Math.ceil(healthToAdd / WALL_UNITS_PER_HEALTH);
+
+    t.units -= unitsConsumed;
+    t.wallHealth += healthToAdd;
+
+    return { added: healthToAdd, newHealth: t.wallHealth, level: this.getWallLevel(stateId) };
+  }
+
+  getWallLevel(stateId: string): number {
+    const h = this.state[stateId]?.wallHealth ?? 0;
+    if (h <= 0) return 0;
+    if (h <= WALL_LEVEL1_MAX) return 1;
+    return 2;
+  }
+
+  getWallHealth(stateId: string): number {
+    return this.state[stateId]?.wallHealth ?? 0;
+  }
+
+  getWallMaxHealth(level: number): number {
+    if (level <= 0) return 0;
+    if (level === 1) return WALL_LEVEL1_MAX;
+    return WALL_LEVEL2_MAX;
+  }
+
   /**
    * Resolve combat: attacker sends `attackers` units against a target state.
    *
@@ -83,23 +125,50 @@ export class GameStateManager {
     const src = this.state[fromId];
     const dst = this.state[toId];
     const defBonus = this.getDefenseBonus(toId);
+
+    // Phase 1: Attackers must break through walls first
+    let remainingAttackersAfterWall = attackers;
+    let wallDamage = 0;
+    if (dst.wallHealth > 0) {
+      // Each wall health absorbs WALL_ABSORB_RATIO attackers
+      const wallCapacity = dst.wallHealth * WALL_ABSORB_RATIO;
+      const attackersUsedOnWall = Math.min(remainingAttackersAfterWall, wallCapacity);
+      wallDamage = Math.ceil(attackersUsedOnWall / WALL_ABSORB_RATIO);
+      remainingAttackersAfterWall -= attackersUsedOnWall;
+      dst.wallHealth = Math.max(0, dst.wallHealth - wallDamage);
+    }
+
+    // Phase 2: Remaining attackers fight the garrison
     const effectiveDefense = Math.floor(dst.units * defBonus);
-    const isNeutralTarget = dst.owner === "neutral";
+    let attackerLost: number;
+    let defenderLost: number;
+    let remainingAttackers: number;
+    let remainingDefenders: number;
 
-    // Power: how many casualties each side inflicts
-    const attackPower = attackers * 0.6;
-    const defensePower = effectiveDefense * 0.7;
+    if (remainingAttackersAfterWall <= 0) {
+      // All attackers consumed by wall
+      attackerLost = attackers;
+      defenderLost = 0;
+      remainingAttackers = 0;
+      remainingDefenders = dst.units;
+    } else {
+      // Normal combat with surviving attackers
+      const attackPower = remainingAttackersAfterWall * 0.6;
+      const defensePower = effectiveDefense * 0.7;
 
-    // Casualties (each side loses what the other inflicts, minimum 1)
-    let attackerLost = Math.max(1, Math.round(defensePower));
-    let defenderLost = Math.max(1, Math.round(attackPower));
+      let aLost = Math.max(1, Math.round(defensePower));
+      let dLost = Math.max(1, Math.round(attackPower));
 
-    // Clamp to actual units
-    attackerLost = Math.min(attackerLost, attackers);
-    defenderLost = Math.min(defenderLost, dst.units);
+      aLost = Math.min(aLost, remainingAttackersAfterWall);
+      dLost = Math.min(dLost, dst.units);
 
-    const remainingAttackers = attackers - attackerLost;
-    const remainingDefenders = dst.units - defenderLost;
+      remainingAttackers = remainingAttackersAfterWall - aLost;
+      remainingDefenders = dst.units - dLost;
+
+      // Total attacker losses include those consumed by wall
+      attackerLost = attackers - remainingAttackers;
+      defenderLost = dLost;
+    }
 
     const defendersEliminated = remainingDefenders <= 0;
 
@@ -110,14 +179,16 @@ export class GameStateManager {
     }
 
     if (defendersEliminated) {
-      if (isNeutralTarget) {
-        // Neutral states are claimed directly — surviving attackers move in
+      if (remainingAttackers > 0) {
+        // Surviving attackers claim the state directly
         dst.owner = src.owner;
-        dst.units = Math.max(1, remainingAttackers);
+        dst.units = remainingAttackers;
+        dst.wallHealth = 0; // walls destroyed on capture
       } else {
-        // Player vs AI: state becomes neutral, must be reclaimed
+        // Exact wipe — no survivors, state goes neutral
         dst.owner = "neutral";
         dst.units = 1;
+        dst.wallHealth = 0;
       }
     } else {
       dst.units = Math.max(1, remainingDefenders);
