@@ -33,6 +33,13 @@ export interface UnitMoveEvent {
 
 export type MoveListener = (event: UnitMoveEvent) => void;
 
+export interface Plane {
+  id: number;
+  owner: Owner;
+  homeId: string;      // state the plane is currently stationed at
+  bombsLeft: number;   // remaining bomb drops before the plane is lost
+}
+
 export interface GameEvent {
   message: string;
   owner: Owner;
