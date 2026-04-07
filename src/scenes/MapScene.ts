@@ -4,6 +4,8 @@ import { stateBonuses } from "../data/stateBonuses";
 import { GameStateManager } from "../state/GameStateManager";
 import { LogicTick } from "../state/LogicTick";
 import { Owner, CombatResult, UnitMoveEvent, GameEvent } from "../types";
+import { sound } from "../audio/SoundManager";
+import { AERIAL_STATES } from "../state/GameStateManager";
 
 const DPR = Math.min(window.devicePixelRatio || 1, 2);
 const IS_MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
@@ -51,7 +53,7 @@ interface StateVisual {
   centroid: [number, number];
 }
 
-type InteractionMode = "select" | "build";
+type InteractionMode = "select" | "build" | "bomb";
 
 
 
@@ -333,13 +335,16 @@ export class MapScene extends Phaser.Scene {
 
   private toggleMode(): void {
     this.deselect();
-    this.mode = this.mode === "select" ? "build" : "select";
-    if (IS_MOBILE) {
-      this.modeText.setText(this.mode === "select" ? "Build" : "Move");
-    } else {
-      this.modeText.setText(this.mode === "select" ? "[R] Build Rails" : "[R] Move Units");
-    }
-    this.modeText.setColor(this.mode === "select" ? "#fbbf24" : "#22d3ee");
+    // Cycle: select → build → bomb → select
+    this.mode = this.mode === "select" ? "build" : this.mode === "build" ? "bomb" : "select";
+    const labels: Record<InteractionMode, { mobile: string; desktop: string; color: string }> = {
+      select: { mobile: "Build", desktop: "[R] Build Rails", color: "#fbbf24" },
+      build: { mobile: "Bomb", desktop: "[R] Bomb Mode", color: "#22d3ee" },
+      bomb: { mobile: "Move", desktop: "[R] Move Units", color: "#f97316" },
+    };
+    const cur = labels[this.mode];
+    this.modeText.setText(IS_MOBILE ? cur.mobile : cur.desktop);
+    this.modeText.setColor(cur.color);
     this.updateInfoDefault();
     this.redrawAll();
   }
@@ -392,7 +397,9 @@ export class MapScene extends Phaser.Scene {
     const isSelected = this.selectedStateId === id;
     const isValidTarget = this.selectedStateId !== null && this.isValidTarget(id);
 
+    const overdamaged = this.gsm.isOverdamaged(id);
     let fillColor = OWNER_COLORS[owner];
+    if (overdamaged) fillColor = 0x57321a; // scorched
     if (hovered) fillColor = this.lightenColor(fillColor, 0.2);
 
     let borderColor = BORDER_COLOR;
@@ -419,11 +426,14 @@ export class MapScene extends Phaser.Scene {
     }
 
     // Show wall health in unit text if walls exist
+    let label: string;
     if (wallLevel > 0) {
-      vis.unitText.setText(`${units} 🛡${wallHealth}`);
+      label = `${units} 🛡${wallHealth}`;
     } else {
-      vis.unitText.setText(String(units));
+      label = String(units);
     }
+    if (overdamaged) label += " 💥";
+    vis.unitText.setText(label);
   }
 
   private drawPoly(
@@ -444,7 +454,7 @@ export class MapScene extends Phaser.Scene {
     gfx.strokePath();
   }
 
-  /** Draw a state with 2.5D wall effect — multiple offset border layers */
+  /** Draw a state with 2.5D wall effect — extruded ramparts with vertical lift. */
   private drawWalledPoly(
     gfx: Phaser.GameObjects.Graphics,
     polygon: [number, number][],
@@ -459,69 +469,94 @@ export class MapScene extends Phaser.Scene {
     const isL2 = wallLevel >= 2;
     const outerColor = isL2 ? WALL_L2_COLOR_OUTER : WALL_L1_COLOR_OUTER;
     const innerColor = isL2 ? WALL_L2_COLOR_INNER : WALL_L1_COLOR_INNER;
+    const topColor = isL2 ? WALL_L2_COLOR_TOP : 0xc4b58a;
     const maxHealth = isL2 ? 100 : 50;
     const healthPct = Math.min(1, wallHealth / maxHealth);
 
-    // Wall thickness scales with health percentage
-    const baseThick = isL2 ? 6 * DPR : 4 * DPR;
-    const wallThick = baseThick * healthPct;
+    // Vertical "lift" of the rampart top above the polygon plane.
+    // This is what sells the 2.5D effect — the walls visibly rise off the map.
+    const liftBase = isL2 ? 12 * DPR : 7 * DPR;
+    const lift = liftBase * (0.5 + 0.5 * healthPct);
+    const wallInset = (isL2 ? 4 : 3) * DPR; // how far the rampart sits inside the polygon edge
 
-    // 2.5D effect: draw offset shadow layer (bottom-right shift)
-    const shadowOffset = isL2 ? 3 * DPR : 2 * DPR;
-    const shadowPoly: [number, number][] = polygon.map(([x, y]) => [x + shadowOffset, y + shadowOffset]);
-    gfx.fillStyle(0x222222, 0.4);
-    gfx.beginPath();
-    gfx.moveTo(shadowPoly[0][0], shadowPoly[0][1]);
-    for (let i = 1; i < shadowPoly.length; i++) gfx.lineTo(shadowPoly[i][0], shadowPoly[i][1]);
-    gfx.closePath();
-    gfx.fillPath();
+    // 1) Base shadow of the state (drop shadow on map)
+    const shadowOffset = isL2 ? 5 * DPR : 3 * DPR;
+    const shadowPoly: [number, number][] = polygon.map(([x, y]) => [x + shadowOffset, y + shadowOffset + lift * 0.4]);
+    gfx.fillStyle(0x000000, 0.45);
+    this.fillPolygon(gfx, shadowPoly);
 
-    // Outer wall border (dark)
-    gfx.lineStyle(wallThick + borderWidth + 2 * DPR, outerColor, 1);
-    gfx.beginPath();
-    gfx.moveTo(polygon[0][0], polygon[0][1]);
-    for (let i = 1; i < polygon.length; i++) gfx.lineTo(polygon[i][0], polygon[i][1]);
-    gfx.closePath();
-    gfx.strokePath();
-
-    // Inner wall highlight (lighter, creates depth)
-    gfx.lineStyle(wallThick + borderWidth, innerColor, 0.8);
-    gfx.beginPath();
-    gfx.moveTo(polygon[0][0], polygon[0][1]);
-    for (let i = 1; i < polygon.length; i++) gfx.lineTo(polygon[i][0], polygon[i][1]);
-    gfx.closePath();
-    gfx.strokePath();
-
-    // Level 2: top highlight edge for extra depth
-    if (isL2) {
-      gfx.lineStyle(wallThick * 0.4, WALL_L2_COLOR_TOP, 0.6);
-      gfx.beginPath();
-      gfx.moveTo(polygon[0][0], polygon[0][1]);
-      for (let i = 1; i < polygon.length; i++) gfx.lineTo(polygon[i][0], polygon[i][1]);
-      gfx.closePath();
-      gfx.strokePath();
-    }
-
-    // Fill the state
+    // 2) Fill the state body
     gfx.fillStyle(fill, 1);
+    this.fillPolygon(gfx, polygon);
+
+    // 3) Compute the inset rampart top polygon (lifted upward in screen space)
+    const center = this.polyCentroid(polygon);
+    const topPoly = polygon.map(([x, y]) => {
+      const dx = x - center[0];
+      const dy = y - center[1];
+      const len = Math.hypot(dx, dy) || 1;
+      // Move inward by wallInset, then lift up by `lift` pixels
+      const ix = x - (dx / len) * wallInset;
+      const iy = y - (dy / len) * wallInset - lift;
+      return [ix, iy] as [number, number];
+    });
+
+    // 4) Build extruded side faces — quads from each base edge to its top edge.
+    // Side faces are darker (outerColor) to read as shaded vertical surfaces.
+    gfx.fillStyle(outerColor, 1);
+    for (let i = 0; i < polygon.length; i++) {
+      const j = (i + 1) % polygon.length;
+      const b1 = polygon[i];
+      const b2 = polygon[j];
+      const t1 = topPoly[i];
+      const t2 = topPoly[j];
+      gfx.beginPath();
+      gfx.moveTo(b1[0], b1[1]);
+      gfx.lineTo(b2[0], b2[1]);
+      gfx.lineTo(t2[0], t2[1]);
+      gfx.lineTo(t1[0], t1[1]);
+      gfx.closePath();
+      gfx.fillPath();
+    }
+
+    // 5) Top rampart surface (bright)
+    gfx.fillStyle(innerColor, 1);
+    this.fillPolygon(gfx, topPoly);
+
+    // 6) Top highlight rim
+    gfx.lineStyle(1.5 * DPR, topColor, 0.9);
+    this.strokePolygon(gfx, topPoly);
+
+    // 7) Original border (slightly muted under the wall)
+    gfx.lineStyle(borderWidth, borderColor, 0.9);
+    this.strokePolygon(gfx, polygon);
+
+    // 8) Battlements for level 2 walls — notches along the top rim
+    if (isL2 && healthPct > 0.3) {
+      this.drawBattlements(gfx, topPoly, topColor);
+    }
+  }
+
+  private fillPolygon(gfx: Phaser.GameObjects.Graphics, poly: [number, number][]): void {
     gfx.beginPath();
-    gfx.moveTo(polygon[0][0], polygon[0][1]);
-    for (let i = 1; i < polygon.length; i++) gfx.lineTo(polygon[i][0], polygon[i][1]);
+    gfx.moveTo(poly[0][0], poly[0][1]);
+    for (let i = 1; i < poly.length; i++) gfx.lineTo(poly[i][0], poly[i][1]);
     gfx.closePath();
     gfx.fillPath();
+  }
 
-    // Normal border on top
-    gfx.lineStyle(borderWidth, borderColor, 1);
+  private strokePolygon(gfx: Phaser.GameObjects.Graphics, poly: [number, number][]): void {
     gfx.beginPath();
-    gfx.moveTo(polygon[0][0], polygon[0][1]);
-    for (let i = 1; i < polygon.length; i++) gfx.lineTo(polygon[i][0], polygon[i][1]);
+    gfx.moveTo(poly[0][0], poly[0][1]);
+    for (let i = 1; i < poly.length; i++) gfx.lineTo(poly[i][0], poly[i][1]);
     gfx.closePath();
     gfx.strokePath();
+  }
 
-    // Battlements for level 2: small notches along the border
-    if (isL2 && healthPct > 0.3) {
-      this.drawBattlements(gfx, polygon, outerColor);
-    }
+  private polyCentroid(poly: [number, number][]): [number, number] {
+    let cx = 0, cy = 0;
+    for (const [x, y] of poly) { cx += x; cy += y; }
+    return [cx / poly.length, cy / poly.length];
   }
 
   /** Draw small battlement notches along polygon edges for fortress look */
@@ -600,8 +635,13 @@ export class MapScene extends Phaser.Scene {
 
   private onPointerDownState(stateId: string, _pointer: Phaser.Input.Pointer): void {
     this.stateWasHit = true; // prevent camera pan when tapping a state
+    sound.unlock(); // user gesture unlocks audio context
     if (this.mode === "build") {
       this.onClickStateBuildMode(stateId);
+      return;
+    }
+    if (this.mode === "bomb") {
+      this.onClickStateBombMode(stateId);
       return;
     }
 
@@ -667,6 +707,81 @@ export class MapScene extends Phaser.Scene {
     this.redrawAll();
   }
 
+  private onClickStateBombMode(stateId: string): void {
+    // Auto-pick any owned aerial-capable state in range
+    const bomberId = this.gsm.findBomberFor(stateId, "player");
+    if (!bomberId) {
+      // Helpful error message
+      const owned = Array.from(AERIAL_STATES).filter(id => this.gsm.getOwner(id) === "player");
+      if (owned.length === 0) {
+        this.infoText.setText("No aerial state owned. Capture CA, TX, FL, WA, IL or NY.");
+      } else {
+        this.infoText.setText("No bomber in range or not enough units (need 4+).");
+      }
+      return;
+    }
+    if (this.gsm.getOwner(stateId) === "player") {
+      this.infoText.setText("Can't bomb your own states.");
+      return;
+    }
+    const bomberVis = this.visuals.get(bomberId);
+    const targetVis = this.visuals.get(stateId);
+    if (!bomberVis || !targetVis) return;
+
+    // Visual: arc a bomb dot from bomber to target, then explode
+    this.animateBomb(bomberVis, targetVis, () => {
+      const result = this.gsm.dropBomb(bomberId, stateId);
+      this.infoText.setText(result.message);
+      this.redrawAll();
+    });
+  }
+
+  private animateBomb(
+    fromVis: StateVisual,
+    toVis: StateVisual,
+    onComplete: () => void,
+  ): void {
+    const sx = fromVis.centroid[0] * DPR;
+    const sy = fromVis.centroid[1] * DPR;
+    const tx = toVis.centroid[0] * DPR;
+    const ty = toVis.centroid[1] * DPR;
+    const dist = Math.hypot(tx - sx, ty - sy);
+    const duration = Math.max(500, Math.min(1400, dist * 1.8));
+
+    const bomb = this.add.circle(sx, sy, 6 * DPR, 0x111827, 1).setStrokeStyle(2 * DPR, 0xfbbf24).setDepth(8);
+    // Arc the bomb upward via tween chain
+    this.tweens.add({
+      targets: bomb,
+      x: tx,
+      y: ty,
+      duration,
+      ease: "Sine.easeIn",
+      onComplete: () => {
+        bomb.destroy();
+        // Explosion: expanding ring + flash
+        const ring = this.add.circle(tx, ty, 8 * DPR, 0xfbbf24, 0.8).setDepth(9);
+        const flash = this.add.circle(tx, ty, 18 * DPR, 0xffffff, 0.6).setDepth(9);
+        this.tweens.add({
+          targets: ring,
+          scale: 5,
+          alpha: 0,
+          duration: 500,
+          ease: "Quad.easeOut",
+          onComplete: () => ring.destroy(),
+        });
+        this.tweens.add({
+          targets: flash,
+          alpha: 0,
+          scale: 2.2,
+          duration: 380,
+          ease: "Quad.easeOut",
+          onComplete: () => flash.destroy(),
+        });
+        onComplete();
+      },
+    });
+  }
+
   private onClickStateBuildMode(stateId: string): void {
     if (this.selectedStateId === null) {
       // Select source state for building
@@ -723,6 +838,7 @@ export class MapScene extends Phaser.Scene {
     // Deduct units from source immediately (so player sees them leave)
     this.gsm.state[fromId].units = 1;
 
+    sound.moveUnits();
     // Animate circles flying to target, then resolve on arrival
     const color = fromOwner === "player" ? 0x60a5fa : 0xf87171;
     this.animateUnitMovement(fromVis, targetVis, attackers, color, () => {
@@ -914,7 +1030,9 @@ export class MapScene extends Phaser.Scene {
   }
 
   private updateInfoDefault(): void {
-    if (this.mode === "build") {
+    if (this.mode === "bomb") {
+      this.infoText.setText("BOMB MODE — tap an enemy state. Aerial: CA TX FL WA IL NY (range-limited)");
+    } else if (this.mode === "build") {
       this.infoText.setText("BUILD MODE — select a state to build/upgrade railways");
     } else if (this.selectedStateId) {
       const vis = this.visuals.get(this.selectedStateId)!;

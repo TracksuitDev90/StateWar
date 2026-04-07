@@ -42,6 +42,7 @@ export class LogicTick {
 
   private tick(): void {
     this.tickCount++;
+    this.gsm.tickCooldowns();
 
     // Unit generation for all owned states
     for (const [id, territory] of Object.entries(this.gsm.state)) {
