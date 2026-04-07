@@ -1,4 +1,4 @@
-import { GameStateManager } from "./GameStateManager";
+import { GameStateManager, AERIAL_STATES, PLANE_COST_UNITS } from "./GameStateManager";
 import { adjacencyGraph } from "../data/adjacency";
 import { stateBonuses } from "../data/stateBonuses";
 
@@ -55,6 +55,38 @@ export class AIController {
 
     // Phase 4: Build railways if we have spare units
     this.phaseBuildRails(aiStates);
+
+    // Phase 5: Planes — build and drop bombs on walled player states
+    this.phasePlanes(aiStates);
+  }
+
+  private phasePlanes(aiStates: string[]): void {
+    // Try to build a plane at a well-supplied owned aerial state
+    for (const id of aiStates) {
+      if (!AERIAL_STATES.has(id)) continue;
+      if (this.gsm.getPlanesAt(id).length > 0) continue;
+      if (this.gsm.getUnits(id) <= PLANE_COST_UNITS + 5) continue;
+      this.gsm.producePlane(id);
+      break;
+    }
+
+    // Use any available plane to bomb the player's best walled state
+    const planes = this.gsm.getPlanesFor("ai");
+    if (planes.length === 0) return;
+
+    let bestTarget: string | null = null;
+    let bestScore = -1;
+    for (const [id, t] of Object.entries(this.gsm.state)) {
+      if (t.owner !== "player") continue;
+      const score = this.gsm.getWallHealth(id) * 2 + t.units;
+      if (score > bestScore) {
+        bestScore = score;
+        bestTarget = id;
+      }
+    }
+    if (!bestTarget) return;
+    const plane = planes[0];
+    this.gsm.dropBomb(plane.homeId, bestTarget);
   }
 
   // ── Attack Phase ──

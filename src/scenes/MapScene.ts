@@ -5,7 +5,7 @@ import { GameStateManager } from "../state/GameStateManager";
 import { LogicTick } from "../state/LogicTick";
 import { Owner, CombatResult, UnitMoveEvent, GameEvent } from "../types";
 import { sound } from "../audio/SoundManager";
-import { AERIAL_STATES } from "../state/GameStateManager";
+import { AERIAL_STATES, PLANE_COST_UNITS } from "../state/GameStateManager";
 
 const DPR = Math.min(window.devicePixelRatio || 1, 2);
 const IS_MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
@@ -50,6 +50,7 @@ interface StateVisual {
   gfxList: Phaser.GameObjects.Graphics[];
   label: Phaser.GameObjects.Text;
   unitText: Phaser.GameObjects.Text;
+  planeText: Phaser.GameObjects.Text;
   centroid: [number, number];
 }
 
@@ -66,6 +67,7 @@ export class MapScene extends Phaser.Scene {
   private gsm!: GameStateManager;
   private logicTick!: LogicTick;
   private selectedStateId: string | null = null;
+  private selectedPlaneHomeId: string | null = null;
   private infoText!: Phaser.GameObjects.Text;
   private statsText!: Phaser.GameObjects.Text;
   private railGfx!: Phaser.GameObjects.Graphics;
@@ -179,7 +181,16 @@ export class MapScene extends Phaser.Scene {
         strokeThickness: 4 * DPR,
       }).setOrigin(0.5).setDepth(3);
 
-      this.visuals.set(state.id, { data: state, gfxList, label, unitText, centroid });
+      const planeText = this.add.text(cx, cy - 22 * DPR, "", {
+        fontSize: `${Math.round(13 * DPR)}px`,
+        color: "#fef9c3",
+        fontFamily: "'Segoe UI', Arial, sans-serif",
+        fontStyle: "bold",
+        stroke: "#000000",
+        strokeThickness: 3 * DPR,
+      }).setOrigin(0.5).setDepth(3);
+
+      this.visuals.set(state.id, { data: state, gfxList, label, unitText, planeText, centroid });
     }
 
     // Screen dimensions (actual game canvas size)
@@ -335,6 +346,7 @@ export class MapScene extends Phaser.Scene {
 
   private toggleMode(): void {
     this.deselect();
+    this.selectedPlaneHomeId = null;
     // Cycle: select → build → bomb → select
     this.mode = this.mode === "select" ? "build" : this.mode === "build" ? "bomb" : "select";
     const labels: Record<InteractionMode, { mobile: string; desktop: string; color: string }> = {
@@ -419,7 +431,7 @@ export class MapScene extends Phaser.Scene {
       const scaled = scaledPolygon(polygon);
 
       if (wallLevel > 0) {
-        this.drawWalledPoly(vis.gfxList[i], scaled, fillColor, borderColor, borderWidth, wallLevel, wallHealth);
+        this.drawWalledPoly(vis.gfxList[i], scaled, fillColor, borderColor, borderWidth, wallLevel, wallHealth, owner);
       } else {
         this.drawPoly(vis.gfxList[i], scaled, fillColor, borderColor, borderWidth);
       }
@@ -434,6 +446,17 @@ export class MapScene extends Phaser.Scene {
     }
     if (overdamaged) label += " 💥";
     vis.unitText.setText(label);
+
+    // Plane indicator
+    const planes = this.gsm.getPlanesAt(id);
+    if (planes.length > 0) {
+      const totalAmmo = planes.reduce((s, p) => s + p.bombsLeft, 0);
+      const selected = this.selectedPlaneHomeId === id;
+      vis.planeText.setText(`${selected ? "▶" : ""}✈ ${totalAmmo}`);
+      vis.planeText.setColor(selected ? "#fbbf24" : "#fef9c3");
+    } else {
+      vis.planeText.setText("");
+    }
   }
 
   private drawPoly(
@@ -463,13 +486,17 @@ export class MapScene extends Phaser.Scene {
     borderWidth: number,
     wallLevel: number,
     wallHealth: number,
+    owner: Owner,
   ): void {
     gfx.clear();
 
     const isL2 = wallLevel >= 2;
-    const outerColor = isL2 ? WALL_L2_COLOR_OUTER : WALL_L1_COLOR_OUTER;
-    const innerColor = isL2 ? WALL_L2_COLOR_INNER : WALL_L1_COLOR_INNER;
-    const topColor = isL2 ? WALL_L2_COLOR_TOP : 0xc4b58a;
+    // Base stone colors then blend with a slight owner tint so walls show allegiance
+    const tint = owner === "player" ? 0x3b82f6 : owner === "ai" ? 0xef4444 : 0x000000;
+    const tintAmt = owner === "neutral" ? 0 : 0.35;
+    const outerColor = this.blendColor(isL2 ? WALL_L2_COLOR_OUTER : WALL_L1_COLOR_OUTER, tint, tintAmt);
+    const innerColor = this.blendColor(isL2 ? WALL_L2_COLOR_INNER : WALL_L1_COLOR_INNER, tint, tintAmt);
+    const topColor = this.blendColor(isL2 ? WALL_L2_COLOR_TOP : 0xc4b58a, tint, tintAmt);
     const maxHealth = isL2 ? 100 : 50;
     const healthPct = Math.min(1, wallHealth / maxHealth);
 
@@ -708,30 +735,56 @@ export class MapScene extends Phaser.Scene {
   }
 
   private onClickStateBombMode(stateId: string): void {
-    // Auto-pick any owned aerial-capable state in range
-    const bomberId = this.gsm.findBomberFor(stateId, "player");
-    if (!bomberId) {
-      // Helpful error message
-      const owned = Array.from(AERIAL_STATES).filter(id => this.gsm.getOwner(id) === "player");
-      if (owned.length === 0) {
-        this.infoText.setText("No aerial state owned. Capture CA, TX, FL, WA, IL or NY.");
-      } else {
-        this.infoText.setText("No bomber in range or not enough units (need 4+).");
-      }
-      return;
-    }
-    if (this.gsm.getOwner(stateId) === "player") {
-      this.infoText.setText("Can't bomb your own states.");
-      return;
-    }
-    const bomberVis = this.visuals.get(bomberId);
-    const targetVis = this.visuals.get(stateId);
-    if (!bomberVis || !targetVis) return;
+    const owner = this.gsm.getOwner(stateId);
+    const vis = this.visuals.get(stateId);
+    if (!vis) return;
 
-    // Visual: arc a bomb dot from bomber to target, then explode
-    this.animateBomb(bomberVis, targetVis, () => {
-      const result = this.gsm.dropBomb(bomberId, stateId);
+    // Tap own state: build a plane (if affordable) or select an existing plane.
+    if (owner === "player") {
+      const existing = this.gsm.getPlanesAt(stateId);
+      if (existing.length > 0) {
+        // Select / deselect
+        if (this.selectedPlaneHomeId === stateId) {
+          this.selectedPlaneHomeId = null;
+          this.infoText.setText(`Plane deselected`);
+        } else {
+          this.selectedPlaneHomeId = stateId;
+          this.infoText.setText(`${vis.data.name} plane selected (${existing[0].bombsLeft} bombs) — tap any enemy state to bomb it`);
+        }
+        this.redrawAll();
+        return;
+      }
+      if (!AERIAL_STATES.has(stateId)) {
+        this.infoText.setText(`Planes can only be built in aerial states: CA TX FL WA IL NY`);
+        return;
+      }
+      const result = this.gsm.producePlane(stateId);
       this.infoText.setText(result.message);
+      if (result.success) {
+        this.selectedPlaneHomeId = stateId;
+      }
+      this.redrawAll();
+      return;
+    }
+
+    // Tap enemy/neutral state: must have a selected plane to bomb it
+    if (!this.selectedPlaneHomeId) {
+      this.infoText.setText(`Tap an owned aerial state first to build (cost ${PLANE_COST_UNITS}) or select a plane`);
+      return;
+    }
+    const homeId = this.selectedPlaneHomeId;
+    const bomberVis = this.visuals.get(homeId);
+    if (!bomberVis) return;
+
+    // Fly to target, bomb, fly back (if plane still exists)
+    this.animateBomb(bomberVis, vis, () => {
+      const result = this.gsm.dropBomb(homeId, stateId);
+      this.infoText.setText(result.message);
+      // If plane still exists, animate it returning home (visual only)
+      const stillThere = this.gsm.getPlanesAt(homeId).length > 0;
+      if (!stillThere) {
+        this.selectedPlaneHomeId = null;
+      }
       this.redrawAll();
     });
   }
@@ -1031,7 +1084,7 @@ export class MapScene extends Phaser.Scene {
 
   private updateInfoDefault(): void {
     if (this.mode === "bomb") {
-      this.infoText.setText("BOMB MODE — tap an enemy state. Aerial: CA TX FL WA IL NY (range-limited)");
+      this.infoText.setText(`BOMB MODE — tap an aerial state (CA TX FL WA IL NY) to build/select a plane (costs ${PLANE_COST_UNITS}), then tap any enemy state`);
     } else if (this.mode === "build") {
       this.infoText.setText("BUILD MODE — select a state to build/upgrade railways");
     } else if (this.selectedStateId) {
@@ -1089,6 +1142,15 @@ export class MapScene extends Phaser.Scene {
     let cx = 0, cy = 0;
     for (const [x, y] of polygon) { cx += x; cy += y; }
     return [cx / polygon.length, cy / polygon.length];
+  }
+
+  private blendColor(base: number, tint: number, amount: number): number {
+    const br = (base >> 16) & 0xff, bg = (base >> 8) & 0xff, bb = base & 0xff;
+    const tr = (tint >> 16) & 0xff, tg = (tint >> 8) & 0xff, tb = tint & 0xff;
+    const r = Math.round(br + (tr - br) * amount);
+    const g = Math.round(bg + (tg - bg) * amount);
+    const b = Math.round(bb + (tb - bb) * amount);
+    return (r << 16) | (g << 8) | b;
   }
 
   private lightenColor(color: number, amount: number): number {

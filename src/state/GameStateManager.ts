@@ -1,4 +1,4 @@
-import { GameState, Owner, CombatResult, RailwayState, MoveListener, UnitMoveEvent, GameEvent, GameEventListener } from "../types";
+import { GameState, Owner, CombatResult, RailwayState, MoveListener, UnitMoveEvent, GameEvent, GameEventListener, Plane } from "../types";
 import { stateData } from "../data/states";
 import { adjacencyGraph } from "../data/adjacency";
 import { stateDefenseBonus } from "../data/stateDefense";
@@ -8,12 +8,15 @@ import { sound } from "../audio/SoundManager";
 // States with aerial bombing capability.
 export const AERIAL_STATES = new Set(["CA", "TX", "FL", "WA", "IL", "NY"]);
 // Bomb tuning
-const BOMB_COST_UNITS = 3;
-const BOMB_WALL_DAMAGE = 35;
+const BOMB_WALL_DAMAGE = 50;        // planes shred walls
 const BOMB_UNIT_KILL_BASE = 2;
 const BOMB_UNIT_KILL_PCT = 0.25;
 const BOMB_OVERDAMAGE_COOLDOWN = 25; // ticks
-const BOMB_RANGE = 420; // raw map coordinate units (centroid-to-centroid)
+
+// Plane tuning — planes are expensive to acquire but very destructive
+export const PLANE_COST_UNITS = 20;   // units consumed to build a plane
+export const PLANE_BOMB_USES = 3;     // bombs per plane before it is lost
+const MAX_PLANES_PER_STATE = 1;
 
 const PLAYER_START = ["CA"];
 const AI_START = ["NY"];
@@ -30,15 +33,11 @@ const WALL_ABSORB_RATIO = 3;     // 3 attackers consumed per 1 wall health
 const stateNameMap: Record<string, string> = {};
 for (const s of stateData) stateNameMap[s.id] = s.name;
 
-function centroidOf(polygon: [number, number][]): [number, number] {
-  let cx = 0, cy = 0;
-  for (const [x, y] of polygon) { cx += x; cy += y; }
-  return [cx / polygon.length, cy / polygon.length];
-}
-
 export class GameStateManager {
   public state: GameState = {};
   public railways: RailwayState[] = [];
+  public planes: Plane[] = [];
+  private nextPlaneId = 1;
   private moveListeners: MoveListener[] = [];
   private gameEventListeners: GameEventListener[] = [];
 
@@ -114,44 +113,72 @@ export class GameStateManager {
     return (this.state[stateId]?.bombCooldown ?? 0) > 0;
   }
 
-  /** Can `fromId` (must be aerial-capable + owned) bomb `toId`? */
-  canBomb(fromId: string, toId: string): boolean {
-    const src = this.state[fromId];
-    const dst = this.state[toId];
-    if (!src || !dst) return false;
-    if (fromId === toId) return false;
-    if (!AERIAL_STATES.has(fromId)) return false;
-    if (src.units <= BOMB_COST_UNITS) return false;
-    return this.bombDistance(fromId, toId) <= BOMB_RANGE;
+  // ── Planes ──
+
+  /** Can this state produce a plane right now? */
+  canProducePlane(stateId: string, owner: Owner): boolean {
+    const t = this.state[stateId];
+    if (!t || t.owner !== owner) return false;
+    if (!AERIAL_STATES.has(stateId)) return false;
+    if (this.getPlanesAt(stateId).length >= MAX_PLANES_PER_STATE) return false;
+    if (t.units <= PLANE_COST_UNITS) return false;
+    return true;
   }
 
-  /** Find any owned aerial-capable state that can bomb the target. */
-  findBomberFor(targetId: string, owner: Owner): string | null {
-    for (const id of AERIAL_STATES) {
-      const t = this.state[id];
-      if (!t || t.owner !== owner) continue;
-      if (this.canBomb(id, targetId)) return id;
+  /** Build a plane stationed at an owned aerial state. */
+  producePlane(stateId: string): { success: boolean; message: string; plane?: Plane } {
+    const t = this.state[stateId];
+    if (!t) return { success: false, message: "Invalid state" };
+    if (!AERIAL_STATES.has(stateId)) {
+      return { success: false, message: "Only aerial states can build planes" };
     }
-    return null;
+    if (this.getPlanesAt(stateId).length >= MAX_PLANES_PER_STATE) {
+      return { success: false, message: "A plane is already stationed here" };
+    }
+    if (t.units <= PLANE_COST_UNITS) {
+      return { success: false, message: `Need ${PLANE_COST_UNITS + 1}+ units (have ${t.units})` };
+    }
+    t.units -= PLANE_COST_UNITS;
+    const plane: Plane = {
+      id: this.nextPlaneId++,
+      owner: t.owner,
+      homeId: stateId,
+      bombsLeft: PLANE_BOMB_USES,
+    };
+    this.planes.push(plane);
+    sound.buildWall();
+    const name = stateNameMap[stateId] ?? stateId;
+    this.emitGameEvent(`${t.owner === "player" ? "You" : "AI"} built a plane at ${name}`, t.owner);
+    return { success: true, message: `Plane built at ${name} (−${PLANE_COST_UNITS} units)`, plane };
   }
 
-  private bombDistance(a: string, b: string): number {
-    const da = stateData.find(s => s.id === a);
-    const db = stateData.find(s => s.id === b);
-    if (!da || !db) return Infinity;
-    const ca = centroidOf(da.polygons[0]);
-    const cb = centroidOf(db.polygons[0]);
-    return Math.hypot(ca[0] - cb[0], ca[1] - cb[1]);
+  getPlanesAt(stateId: string): Plane[] {
+    return this.planes.filter(p => p.homeId === stateId);
   }
 
-  /** Drop a bomb. Heavy wall damage, kills some units, may overdamage state. */
+  getPlanesFor(owner: Owner): Plane[] {
+    return this.planes.filter(p => p.owner === owner);
+  }
+
+  /** Remove any planes whose home state is no longer owned by their owner. */
+  private pruneOrphanedPlanes(): void {
+    this.planes = this.planes.filter(p => this.state[p.homeId]?.owner === p.owner);
+  }
+
+  /** Drop a bomb using a plane stationed at `fromId`. Range unlimited. */
   dropBomb(fromId: string, toId: string): { success: boolean; message: string; wallDamage: number; unitsKilled: number; overdamaged: boolean } {
     const src = this.state[fromId];
     const dst = this.state[toId];
     if (!src || !dst) return { success: false, message: "Invalid", wallDamage: 0, unitsKilled: 0, overdamaged: false };
-    if (!this.canBomb(fromId, toId)) return { success: false, message: "Out of range or no bomber", wallDamage: 0, unitsKilled: 0, overdamaged: false };
+    if (fromId === toId) return { success: false, message: "Can't bomb home state", wallDamage: 0, unitsKilled: 0, overdamaged: false };
+    const plane = this.getPlanesAt(fromId).find(p => p.owner === src.owner);
+    if (!plane) return { success: false, message: "No plane at this state", wallDamage: 0, unitsKilled: 0, overdamaged: false };
 
-    src.units -= BOMB_COST_UNITS;
+    plane.bombsLeft -= 1;
+    const planeLost = plane.bombsLeft <= 0;
+    if (planeLost) {
+      this.planes = this.planes.filter(p => p.id !== plane.id);
+    }
 
     const wallDamage = Math.min(dst.wallHealth, BOMB_WALL_DAMAGE);
     dst.wallHealth = Math.max(0, dst.wallHealth - BOMB_WALL_DAMAGE);
@@ -176,10 +203,11 @@ export class GameStateManager {
     const dstName = stateNameMap[toId] ?? toId;
     const who = src.owner === "player" ? "You" : "AI";
     const tag = overdamaged ? " — OVERDAMAGED" : "";
-    this.emitGameEvent(`${who} bombed ${dstName}${tag}`, src.owner);
+    this.emitGameEvent(`${who} bombed ${dstName}${tag}${planeLost ? " (plane lost)" : ""}`, src.owner);
+    const planeNote = planeLost ? " — plane destroyed" : ` — plane ammo ${plane.bombsLeft}`;
     return {
       success: true,
-      message: `Bombed ${dstName}: −${wallDamage} wall, −${unitsKilled} units${overdamaged ? " (overdamaged)" : ""}`,
+      message: `Bombed ${dstName}: −${wallDamage} wall, −${unitsKilled} units${overdamaged ? " (overdamaged)" : ""}${planeNote}`,
       wallDamage,
       unitsKilled,
       overdamaged,
@@ -324,6 +352,8 @@ export class GameStateManager {
     }
 
     if (src.units < 1) src.units = 1;
+
+    if (defendersEliminated) this.pruneOrphanedPlanes();
 
     // Emit game event for the feed
     const defenderName = stateNameMap[toId] ?? toId;
