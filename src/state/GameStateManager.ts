@@ -3,6 +3,17 @@ import { stateData } from "../data/states";
 import { adjacencyGraph } from "../data/adjacency";
 import { stateDefenseBonus } from "../data/stateDefense";
 import { RAIL_BUILD_COST } from "../data/railways";
+import { sound } from "../audio/SoundManager";
+
+// States with aerial bombing capability.
+export const AERIAL_STATES = new Set(["CA", "TX", "FL", "WA", "IL", "NY"]);
+// Bomb tuning
+const BOMB_COST_UNITS = 3;
+const BOMB_WALL_DAMAGE = 35;
+const BOMB_UNIT_KILL_BASE = 2;
+const BOMB_UNIT_KILL_PCT = 0.25;
+const BOMB_OVERDAMAGE_COOLDOWN = 25; // ticks
+const BOMB_RANGE = 420; // raw map coordinate units (centroid-to-centroid)
 
 const PLAYER_START = ["CA"];
 const AI_START = ["NY"];
@@ -18,6 +29,12 @@ const WALL_ABSORB_RATIO = 3;     // 3 attackers consumed per 1 wall health
 // State name lookup
 const stateNameMap: Record<string, string> = {};
 for (const s of stateData) stateNameMap[s.id] = s.name;
+
+function centroidOf(polygon: [number, number][]): [number, number] {
+  let cx = 0, cy = 0;
+  for (const [x, y] of polygon) { cx += x; cy += y; }
+  return [cx / polygon.length, cy / polygon.length];
+}
 
 export class GameStateManager {
   public state: GameState = {};
@@ -55,7 +72,7 @@ export class GameStateManager {
         units = STARTING_UNITS;
       }
 
-      this.state[s.id] = { owner, units, wallHealth: 0 };
+      this.state[s.id] = { owner, units, wallHealth: 0, bombCooldown: 0 };
     }
   }
 
@@ -82,7 +99,91 @@ export class GameStateManager {
     src.units -= count;
     dst.units += count;
     this.emitMove({ from, to, count, owner: src.owner });
+    sound.moveUnits();
     return true;
+  }
+
+  /** Decrement bomb overdamage cooldowns. Called once per logic tick. */
+  tickCooldowns(): void {
+    for (const t of Object.values(this.state)) {
+      if (t.bombCooldown > 0) t.bombCooldown--;
+    }
+  }
+
+  isOverdamaged(stateId: string): boolean {
+    return (this.state[stateId]?.bombCooldown ?? 0) > 0;
+  }
+
+  /** Can `fromId` (must be aerial-capable + owned) bomb `toId`? */
+  canBomb(fromId: string, toId: string): boolean {
+    const src = this.state[fromId];
+    const dst = this.state[toId];
+    if (!src || !dst) return false;
+    if (fromId === toId) return false;
+    if (!AERIAL_STATES.has(fromId)) return false;
+    if (src.units <= BOMB_COST_UNITS) return false;
+    return this.bombDistance(fromId, toId) <= BOMB_RANGE;
+  }
+
+  /** Find any owned aerial-capable state that can bomb the target. */
+  findBomberFor(targetId: string, owner: Owner): string | null {
+    for (const id of AERIAL_STATES) {
+      const t = this.state[id];
+      if (!t || t.owner !== owner) continue;
+      if (this.canBomb(id, targetId)) return id;
+    }
+    return null;
+  }
+
+  private bombDistance(a: string, b: string): number {
+    const da = stateData.find(s => s.id === a);
+    const db = stateData.find(s => s.id === b);
+    if (!da || !db) return Infinity;
+    const ca = centroidOf(da.polygons[0]);
+    const cb = centroidOf(db.polygons[0]);
+    return Math.hypot(ca[0] - cb[0], ca[1] - cb[1]);
+  }
+
+  /** Drop a bomb. Heavy wall damage, kills some units, may overdamage state. */
+  dropBomb(fromId: string, toId: string): { success: boolean; message: string; wallDamage: number; unitsKilled: number; overdamaged: boolean } {
+    const src = this.state[fromId];
+    const dst = this.state[toId];
+    if (!src || !dst) return { success: false, message: "Invalid", wallDamage: 0, unitsKilled: 0, overdamaged: false };
+    if (!this.canBomb(fromId, toId)) return { success: false, message: "Out of range or no bomber", wallDamage: 0, unitsKilled: 0, overdamaged: false };
+
+    src.units -= BOMB_COST_UNITS;
+
+    const wallDamage = Math.min(dst.wallHealth, BOMB_WALL_DAMAGE);
+    dst.wallHealth = Math.max(0, dst.wallHealth - BOMB_WALL_DAMAGE);
+
+    const unitsKilled = Math.max(BOMB_UNIT_KILL_BASE, Math.floor(dst.units * BOMB_UNIT_KILL_PCT));
+    const newUnits = dst.units - unitsKilled;
+    let overdamaged = false;
+    if (newUnits <= 0) {
+      // Over-damaged: state survives with 1 unit but is locked from capture for a while.
+      dst.units = 1;
+      dst.bombCooldown = BOMB_OVERDAMAGE_COOLDOWN;
+      overdamaged = true;
+    } else {
+      dst.units = newUnits;
+      // Direct heavy hits also briefly daze the state
+      if (unitsKilled >= 5) {
+        dst.bombCooldown = Math.max(dst.bombCooldown, 8);
+      }
+    }
+
+    sound.bomb();
+    const dstName = stateNameMap[toId] ?? toId;
+    const who = src.owner === "player" ? "You" : "AI";
+    const tag = overdamaged ? " — OVERDAMAGED" : "";
+    this.emitGameEvent(`${who} bombed ${dstName}${tag}`, src.owner);
+    return {
+      success: true,
+      message: `Bombed ${dstName}: −${wallDamage} wall, −${unitsKilled} units${overdamaged ? " (overdamaged)" : ""}`,
+      wallDamage,
+      unitsKilled,
+      overdamaged,
+    };
   }
 
   /** Absorb units into wall defense. Returns amount of health added. */
@@ -103,6 +204,7 @@ export class GameStateManager {
 
     const name = stateNameMap[stateId] ?? stateId;
     this.emitGameEvent(`${t.owner === "player" ? "You" : "AI"} fortified ${name}`, t.owner);
+    sound.buildWall();
 
     return { added: healthToAdd, newHealth: t.wallHealth, level: this.getWallLevel(stateId) };
   }
@@ -142,6 +244,7 @@ export class GameStateManager {
     const src = this.state[fromId];
     const dst = this.state[toId];
     const defBonus = this.getDefenseBonus(toId);
+    const prevDstOwner: Owner = dst.owner;
 
     // Phase 1: Attackers must break through walls first
     let remainingAttackersAfterWall = attackers;
@@ -187,7 +290,14 @@ export class GameStateManager {
       defenderLost = dLost;
     }
 
-    const defendersEliminated = remainingDefenders <= 0;
+    let defendersEliminated = remainingDefenders <= 0;
+    // Overdamaged states cannot be captured — survivors stall outside.
+    if (defendersEliminated && dst.bombCooldown > 0) {
+      defendersEliminated = false;
+      remainingDefenders = 1;
+      remainingAttackers = 0;
+      attackerLost = attackers;
+    }
 
     // Apply to game state
     if (!skipSourceDeduction) {
@@ -201,11 +311,13 @@ export class GameStateManager {
         dst.owner = src.owner;
         dst.units = remainingAttackers;
         dst.wallHealth = 0; // walls destroyed on capture
+        dst.bombCooldown = 0;
       } else {
         // Exact wipe — no survivors, state goes neutral
         dst.owner = "neutral";
         dst.units = 1;
         dst.wallHealth = 0;
+        dst.bombCooldown = 0;
       }
     } else {
       dst.units = Math.max(1, remainingDefenders);
@@ -218,6 +330,13 @@ export class GameStateManager {
     const who = src.owner === "player" ? "You" : "AI";
     if (defendersEliminated) {
       this.emitGameEvent(`${who} captured ${defenderName}`, src.owner);
+      if (src.owner === "player") {
+        sound.acquireState();
+      } else if (prevDstOwner === "player") {
+        sound.loseState();
+      } else {
+        sound.acquireState();
+      }
     } else {
       this.emitGameEvent(`${who} attacked ${defenderName} — repelled`, src.owner);
     }
@@ -238,6 +357,7 @@ export class GameStateManager {
     if (!src || !dst) return false;
     if (src.owner === dst.owner) return false;
     if (src.units <= 1) return false;
+    if (dst.bombCooldown > 0) return false;
     const neighbors = adjacencyGraph[fromId] ?? [];
     if (neighbors.includes(toId)) return true;
     return this.hasRailway(fromId, toId, src.owner);
