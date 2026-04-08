@@ -7,7 +7,7 @@ import { stateBonuses } from "../data/stateBonuses";
 //   1. Expand: attack weak neutral/enemy neighbors when we have a clear advantage
 //   2. Reinforce: shore up border states that are exposed to enemy territory
 //   3. Consolidate: move units from safe interior states toward the front line
-//   4. Build rails: invest in railways when flush with units
+//   4. Planes: build/use planes against the player's best walled states
 //
 // Rubber-banding: track player units-per-minute and slightly boost AI gen
 // if the player is pulling too far ahead.
@@ -17,7 +17,6 @@ const PLAYER_OWNER = "player" as const;
 
 const ATTACK_THRESHOLD = 2.5;    // attack if we have 2.5× the effective defense (more cautious)
 const CONSOLIDATE_THRESHOLD = 12; // interior states above this send units forward (slower consolidation)
-const RAIL_BUILD_THRESHOLD = 20; // only build rails when source state has 20+ units
 const WALL_BUILD_THRESHOLD = 25; // fortify borders when 25+ units
 
 // Rubber-banding (reduced)
@@ -53,10 +52,7 @@ export class AIController {
     // Phase 3: Fortify border states with walls
     this.phaseFortify(aiStates);
 
-    // Phase 4: Build railways if we have spare units
-    this.phaseBuildRails(aiStates);
-
-    // Phase 5: Planes — build and drop bombs on walled player states
+    // Phase 4: Planes — build and drop bombs on walled player states
     this.phasePlanes(aiStates);
   }
 
@@ -196,29 +192,6 @@ export class AIController {
 
       this.gsm.fortifyWall(stateId);
       return; // one fortification per tick
-    }
-  }
-
-  // ── Railway Phase ──
-
-  private phaseBuildRails(aiStates: string[]): void {
-    // Only build if AI is doing well (has 5+ states)
-    if (aiStates.length < 5) return;
-
-    for (const stateId of aiStates) {
-      const units = this.gsm.getUnits(stateId);
-      if (units < RAIL_BUILD_THRESHOLD) continue;
-
-      // Find an AI-owned state that isn't already connected by rail
-      for (const targetId of aiStates) {
-        if (targetId === stateId) continue;
-        if (this.gsm.getRailway(stateId, targetId)) continue;
-        // Prefer connecting to border states
-        if (!this.isBorderState(targetId)) continue;
-
-        const result = this.gsm.buildRailway(stateId, targetId);
-        if (result.success) return; // only one build per tick
-      }
     }
   }
 

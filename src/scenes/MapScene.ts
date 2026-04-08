@@ -24,11 +24,6 @@ const BORDER_COLOR = 0x1f2937;
 const BORDER_WIDTH = 1.5 * DPR;
 const SELECTED_BORDER_WIDTH = 3 * DPR;
 
-// Railway visuals
-const RAIL_COLOR_PLAYER = 0x60a5fa; // blue tint for player rails
-const RAIL_COLOR_AI = 0xf87171;     // red tint for AI rails
-const RAIL_LINE_WIDTH = 2.5;
-
 // Wall visuals
 const WALL_L1_COLOR_OUTER = 0x8b7355;  // brown stone outer
 const WALL_L1_COLOR_INNER = 0xa0906a;  // lighter stone inner
@@ -36,6 +31,8 @@ const WALL_L2_COLOR_OUTER = 0x4a4a5a;  // dark fortress outer
 const WALL_L2_COLOR_INNER = 0x6a6a7a;  // lighter fortress inner
 const WALL_L2_COLOR_TOP   = 0x8a8a9a;  // top highlight for 2.5D
 const DOUBLE_TAP_MS = 400; // max ms between taps for double-tap
+const LONG_PRESS_MS = 450; // hold this long on an owned state to open the action menu
+const LONG_PRESS_MOVE_TOL = 8; // pixels of movement before long-press is canceled
 
 // Mobile pinch-to-zoom bounds
 const MOBILE_MIN_ZOOM = 0.6;
@@ -54,8 +51,11 @@ interface StateVisual {
   centroid: [number, number];
 }
 
-type InteractionMode = "select" | "build" | "bomb";
-
+interface StateMenu {
+  stateId: string;
+  container: Phaser.GameObjects.Container;
+  planeIcons: Phaser.GameObjects.Container[];
+}
 
 
 function scaledPolygon(polygon: [number, number][]): [number, number][] {
@@ -67,12 +67,11 @@ export class MapScene extends Phaser.Scene {
   private gsm!: GameStateManager;
   private logicTick!: LogicTick;
   private selectedStateId: string | null = null;
-  private selectedPlaneHomeId: string | null = null;
   private infoText!: Phaser.GameObjects.Text;
   private statsText!: Phaser.GameObjects.Text;
-  private railGfx!: Phaser.GameObjects.Graphics;
-  private modeText!: Phaser.GameObjects.Text;
-  private mode: InteractionMode = "select";
+  private pauseText!: Phaser.GameObjects.Text;
+  private pauseOverlay!: Phaser.GameObjects.Container;
+  private isPaused = false;
 
   // Drag-to-move state
   private dragSourceId: string | null = null;
@@ -82,6 +81,19 @@ export class MapScene extends Phaser.Scene {
   // Double-tap detection for wall building
   private lastTapStateId: string | null = null;
   private lastTapTime = 0;
+
+  // Long-press detection for state action menu
+  private longPressTimer: number | null = null;
+  private longPressStartX = 0;
+  private longPressStartY = 0;
+
+  // State action menu (long-press popup with planes)
+  private stateMenu: StateMenu | null = null;
+
+  // Plane drag state (dragging a plane icon from the menu to a target state)
+  private planeDragLineGfx!: Phaser.GameObjects.Graphics;
+  private planeDragSourceId: string | null = null;
+  private isDraggingPlane = false;
 
   // Mobile camera panning
   private isPanning = false;
@@ -130,11 +142,9 @@ export class MapScene extends Phaser.Scene {
       }
     });
 
-    // Railway layer (drawn under states)
-    this.railGfx = this.add.graphics().setDepth(0);
-
     // Drag line layer (drawn above states)
     this.dragLineGfx = this.add.graphics().setDepth(7);
+    this.planeDragLineGfx = this.add.graphics().setDepth(11);
 
     // Build visuals for each state
     for (const state of stateData) {
@@ -221,20 +231,23 @@ export class MapScene extends Phaser.Scene {
     }).setOrigin(1, 1).setDepth(4);
     if (IS_MOBILE) this.statsText.setScrollFactor(0);
 
-    // Mode toggle button (bottom-left)
-    const modeSize = Math.round(14 * DPR);
-    const modeLabel = IS_MOBILE ? "Build" : "[R] Build Rails";
-    this.modeText = this.add.text(10 * DPR, statsY, modeLabel, {
-      fontSize: `${modeSize}px`,
+    // Pause / Start button (bottom-left)
+    const pauseSize = Math.round(14 * DPR);
+    this.pauseText = this.add.text(10 * DPR, statsY, IS_MOBILE ? "Pause" : "[P] Pause", {
+      fontSize: `${pauseSize}px`,
       color: "#fbbf24",
       fontFamily: "'Segoe UI', Arial, sans-serif",
       fontStyle: "bold",
       backgroundColor: "#1f2937",
       padding: { x: 8 * DPR, y: 5 * DPR },
     }).setOrigin(0, 1).setDepth(4).setInteractive({ useHandCursor: true });
-    if (IS_MOBILE) this.modeText.setScrollFactor(0);
+    if (IS_MOBILE) this.pauseText.setScrollFactor(0);
 
-    this.modeText.on("pointerdown", () => this.toggleMode());
+    this.pauseText.on("pointerdown", () => this.togglePause());
+
+    // Pause overlay (hidden until paused)
+    this.pauseOverlay = this.buildPauseOverlay(screenW, screenH);
+    this.pauseOverlay.setVisible(false);
 
     // Game event feed (fixed to viewport, above stats area)
     const feedY = IS_MOBILE ? screenH - 50 * DPR : screenH - 50 * DPR;
@@ -257,7 +270,14 @@ export class MapScene extends Phaser.Scene {
 
     // Right-click or Escape to deselect
     this.input.on("pointerdown", (pointer: Phaser.Input.Pointer) => {
-      if (pointer.rightButtonDown()) { this.deselect(); return; }
+      if (pointer.rightButtonDown()) { this.deselect(); this.closeStateMenu(); return; }
+
+      // If menu is open and the press did NOT land on a state, dismiss it.
+      // (Plane drags from the menu start with stateWasHit=false too — they
+      // are detected on pointerup based on planeDragSourceId.)
+      if (this.stateMenu && !this.stateWasHit && !this.isDraggingPlane) {
+        this.closeStateMenu();
+      }
 
       // Mobile camera panning: if no state was hit, start pan
       if (IS_MOBILE && !this.stateWasHit) {
@@ -299,6 +319,21 @@ export class MapScene extends Phaser.Scene {
         return;
       }
 
+      // Plane drag from menu
+      if (this.isDraggingPlane && this.planeDragSourceId) {
+        this.drawPlaneDragLine(pointer);
+        return;
+      }
+
+      // Cancel pending long-press if pointer moves too far
+      if (this.longPressTimer !== null) {
+        const dx = pointer.x - this.longPressStartX;
+        const dy = pointer.y - this.longPressStartY;
+        if (dx * dx + dy * dy > LONG_PRESS_MOVE_TOL * LONG_PRESS_MOVE_TOL * DPR * DPR) {
+          this.cancelLongPress();
+        }
+      }
+
       if (!this.isDragging || !this.dragSourceId) return;
       this.drawDragLine(pointer);
     });
@@ -306,6 +341,25 @@ export class MapScene extends Phaser.Scene {
     this.input.on("pointerup", (_pointer: Phaser.Input.Pointer) => {
       this.isPanning = false;
       this.pinchStartDist = 0;
+
+      // Resolve plane drag from menu
+      if (this.isDraggingPlane && this.planeDragSourceId) {
+        this.planeDragLineGfx.clear();
+        const wx = _pointer.worldX;
+        const wy = _pointer.worldY;
+        const targetId = this.findStateAtPoint(wx, wy);
+        const sourceId = this.planeDragSourceId;
+        this.isDraggingPlane = false;
+        this.planeDragSourceId = null;
+        if (targetId && targetId !== sourceId && this.gsm.getOwner(targetId) !== "player") {
+          this.closeStateMenu();
+          this.dropPlaneBomb(sourceId, targetId);
+        }
+        return;
+      }
+
+      // Long-press: if timer never fired and pointer up was quick, cancel.
+      this.cancelLongPress();
 
       if (!this.isDragging || !this.dragSourceId) return;
       this.dragLineGfx.clear();
@@ -326,8 +380,8 @@ export class MapScene extends Phaser.Scene {
     });
 
     if (this.input.keyboard) {
-      this.input.keyboard.on("keydown-ESC", () => this.deselect());
-      this.input.keyboard.on("keydown-R", () => this.toggleMode());
+      this.input.keyboard.on("keydown-ESC", () => { this.deselect(); this.closeStateMenu(); });
+      this.input.keyboard.on("keydown-P", () => this.togglePause());
     }
 
     // Start logic tick (1000ms interval, separate from 60fps render)
@@ -342,62 +396,57 @@ export class MapScene extends Phaser.Scene {
     this.updateStats();
   }
 
-  // ── Mode ──
+  // ── Pause ──
 
-  private toggleMode(): void {
-    this.deselect();
-    this.selectedPlaneHomeId = null;
-    // Cycle: select → build → bomb → select
-    this.mode = this.mode === "select" ? "build" : this.mode === "build" ? "bomb" : "select";
-    const labels: Record<InteractionMode, { mobile: string; desktop: string; color: string }> = {
-      select: { mobile: "Build", desktop: "[R] Build Rails", color: "#fbbf24" },
-      build: { mobile: "Bomb", desktop: "[R] Bomb Mode", color: "#22d3ee" },
-      bomb: { mobile: "Move", desktop: "[R] Move Units", color: "#f97316" },
-    };
-    const cur = labels[this.mode];
-    this.modeText.setText(IS_MOBILE ? cur.mobile : cur.desktop);
-    this.modeText.setColor(cur.color);
-    this.updateInfoDefault();
-    this.redrawAll();
+  private togglePause(): void {
+    this.isPaused = !this.isPaused;
+    if (this.isPaused) {
+      this.logicTick.stop();
+      this.closeStateMenu();
+      this.deselect();
+      this.cancelLongPress();
+      this.pauseText.setText(IS_MOBILE ? "Start" : "[P] Start");
+      this.pauseText.setColor("#22d3ee");
+      this.pauseOverlay.setVisible(true);
+    } else {
+      this.logicTick.start();
+      this.pauseText.setText(IS_MOBILE ? "Pause" : "[P] Pause");
+      this.pauseText.setColor("#fbbf24");
+      this.pauseOverlay.setVisible(false);
+    }
+  }
+
+  private buildPauseOverlay(screenW: number, screenH: number): Phaser.GameObjects.Container {
+    const cx = screenW / 2;
+    const cy = screenH / 2;
+    const c = this.add.container(cx, cy).setDepth(20).setScrollFactor(0);
+
+    const dim = this.add.rectangle(0, 0, screenW * 2, screenH * 2, 0x000000, 0.55);
+    const title = this.add.text(0, -30 * DPR, "PAUSED", {
+      fontSize: `${Math.round(48 * DPR)}px`,
+      color: "#fbbf24",
+      fontFamily: "'Segoe UI', Arial, sans-serif",
+      fontStyle: "bold",
+      stroke: "#000000",
+      strokeThickness: 5 * DPR,
+    }).setOrigin(0.5);
+    const sub = this.add.text(0, 30 * DPR, IS_MOBILE ? "tap Start to resume" : "press [P] or click Start to resume", {
+      fontSize: `${Math.round(16 * DPR)}px`,
+      color: "#e5e7eb",
+      fontFamily: "'Segoe UI', Arial, sans-serif",
+      stroke: "#000000",
+      strokeThickness: 3 * DPR,
+    }).setOrigin(0.5);
+
+    c.add([dim, title, sub]);
+    return c;
   }
 
   // ── Rendering ──
 
   private redrawAll(): void {
-    this.drawRailways();
     for (const [id, vis] of this.visuals) {
       this.redrawState(id, vis);
-    }
-  }
-
-  private drawRailways(): void {
-    this.railGfx.clear();
-
-    for (const rail of this.gsm.railways) {
-      const fromVis = this.visuals.get(rail.from);
-      const toVis = this.visuals.get(rail.to);
-      if (!fromVis || !toVis) continue;
-
-      const fx = fromVis.centroid[0] * DPR;
-      const fy = fromVis.centroid[1] * DPR;
-      const tx = toVis.centroid[0] * DPR;
-      const ty = toVis.centroid[1] * DPR;
-
-      const color = rail.owner === "player" ? RAIL_COLOR_PLAYER : RAIL_COLOR_AI;
-      const width = RAIL_LINE_WIDTH * DPR;
-      this.railGfx.lineStyle(width, color, 0.8);
-      this.railGfx.beginPath();
-      this.railGfx.moveTo(fx, fy);
-      this.railGfx.lineTo(tx, ty);
-      this.railGfx.strokePath();
-
-      // Small diamond at midpoint
-      const mx = (fx + tx) / 2;
-      const my = (fy + ty) / 2;
-      const s = 3 * DPR;
-      this.railGfx.fillStyle(color, 1);
-      this.railGfx.fillTriangle(mx, my - s, mx + s, my, mx, my + s);
-      this.railGfx.fillTriangle(mx, my - s, mx - s, my, mx, my + s);
     }
   }
 
@@ -447,13 +496,12 @@ export class MapScene extends Phaser.Scene {
     if (overdamaged) label += " 💥";
     vis.unitText.setText(label);
 
-    // Plane indicator
+    // Plane indicator (above the unit count)
     const planes = this.gsm.getPlanesAt(id);
     if (planes.length > 0) {
       const totalAmmo = planes.reduce((s, p) => s + p.bombsLeft, 0);
-      const selected = this.selectedPlaneHomeId === id;
-      vis.planeText.setText(`${selected ? "▶" : ""}✈ ${totalAmmo}`);
-      vis.planeText.setColor(selected ? "#fbbf24" : "#fef9c3");
+      vis.planeText.setText(`✈ ${totalAmmo}`);
+      vis.planeText.setColor("#fef9c3");
     } else {
       vis.planeText.setText("");
     }
@@ -477,7 +525,12 @@ export class MapScene extends Phaser.Scene {
     gfx.strokePath();
   }
 
-  /** Draw a state with 2.5D wall effect — extruded ramparts with vertical lift. */
+  /**
+   * Draw a state with a 2.5D wall — a ring of raised stone ramparts running
+   * along the polygon's border. The interior keeps the owner's fill colour
+   * so walls read as fortifications around the territory rather than as a
+   * giant grey blob covering it.
+   */
   private drawWalledPoly(
     gfx: Phaser.GameObjects.Graphics,
     polygon: [number, number][],
@@ -501,42 +554,46 @@ export class MapScene extends Phaser.Scene {
     const healthPct = Math.min(1, wallHealth / maxHealth);
 
     // Vertical "lift" of the rampart top above the polygon plane.
-    // This is what sells the 2.5D effect — the walls visibly rise off the map.
-    const liftBase = isL2 ? 12 * DPR : 7 * DPR;
+    const liftBase = isL2 ? 11 * DPR : 6 * DPR;
     const lift = liftBase * (0.5 + 0.5 * healthPct);
-    const wallInset = (isL2 ? 4 : 3) * DPR; // how far the rampart sits inside the polygon edge
 
-    // 1) Base shadow of the state (drop shadow on map)
-    const shadowOffset = isL2 ? 5 * DPR : 3 * DPR;
-    const shadowPoly: [number, number][] = polygon.map(([x, y]) => [x + shadowOffset, y + shadowOffset + lift * 0.4]);
-    gfx.fillStyle(0x000000, 0.45);
-    this.fillPolygon(gfx, shadowPoly);
+    // Wall thickness (in screen pixels) — wider for level 2.
+    const wallThickness = (isL2 ? 6 : 4.5) * DPR;
+    // Gap between the wall's inner edge and the polygon border.
+    const wallEdgeInset = 1 * DPR;
 
-    // 2) Fill the state body
+    // 1) Fill the state body first (interior shows owner color)
     gfx.fillStyle(fill, 1);
     this.fillPolygon(gfx, polygon);
 
-    // 3) Compute the inset rampart top polygon (lifted upward in screen space)
-    const center = this.polyCentroid(polygon);
-    const topPoly = polygon.map(([x, y]) => {
-      const dx = x - center[0];
-      const dy = y - center[1];
-      const len = Math.hypot(dx, dy) || 1;
-      // Move inward by wallInset, then lift up by `lift` pixels
-      const ix = x - (dx / len) * wallInset;
-      const iy = y - (dy / len) * wallInset - lift;
-      return [ix, iy] as [number, number];
-    });
+    // 2) Original border (drawn under the wall)
+    gfx.lineStyle(borderWidth, borderColor, 0.9);
+    this.strokePolygon(gfx, polygon);
 
-    // 4) Build extruded side faces — quads from each base edge to its top edge.
-    // Side faces are darker (outerColor) to read as shaded vertical surfaces.
+    // 3) Compute two inset polygons that bracket the wall ring on the map plane.
+    //    outerRing — sits just inside the polygon edge (wall's outer face base)
+    //    innerRing — wallThickness further inward (wall's inner face base)
+    const outerRing = this.insetPolygon(polygon, wallEdgeInset);
+    const innerRing = this.insetPolygon(polygon, wallEdgeInset + wallThickness);
+
+    // 4) Lift both rings vertically (screen-space) to create the rampart top.
+    const outerTop: [number, number][] = outerRing.map(([x, y]) => [x, y - lift]);
+    const innerTop: [number, number][] = innerRing.map(([x, y]) => [x, y - lift]);
+
+    // 5) Drop shadow under the rampart ring (sells the 2.5D lift on the map)
+    const shadowOffset = isL2 ? 4 * DPR : 2 * DPR;
+    gfx.fillStyle(0x000000, 0.4);
+    this.fillRing(gfx, outerRing.map(([x, y]) => [x + shadowOffset, y + shadowOffset]),
+                       innerRing.map(([x, y]) => [x + shadowOffset, y + shadowOffset]));
+
+    // 6) Outer face (vertical) — darker, gives the wall its body
     gfx.fillStyle(outerColor, 1);
-    for (let i = 0; i < polygon.length; i++) {
-      const j = (i + 1) % polygon.length;
-      const b1 = polygon[i];
-      const b2 = polygon[j];
-      const t1 = topPoly[i];
-      const t2 = topPoly[j];
+    for (let i = 0; i < outerRing.length; i++) {
+      const j = (i + 1) % outerRing.length;
+      const b1 = outerRing[i];
+      const b2 = outerRing[j];
+      const t1 = outerTop[i];
+      const t2 = outerTop[j];
       gfx.beginPath();
       gfx.moveTo(b1[0], b1[1]);
       gfx.lineTo(b2[0], b2[1]);
@@ -546,21 +603,64 @@ export class MapScene extends Phaser.Scene {
       gfx.fillPath();
     }
 
-    // 5) Top rampart surface (bright)
+    // 7) Inner face (vertical) — slightly darker shade for depth
+    const innerFaceColor = this.blendColor(outerColor, 0x000000, 0.25);
+    gfx.fillStyle(innerFaceColor, 1);
+    for (let i = 0; i < innerRing.length; i++) {
+      const j = (i + 1) % innerRing.length;
+      const b1 = innerRing[i];
+      const b2 = innerRing[j];
+      const t1 = innerTop[i];
+      const t2 = innerTop[j];
+      gfx.beginPath();
+      gfx.moveTo(b1[0], b1[1]);
+      gfx.lineTo(b2[0], b2[1]);
+      gfx.lineTo(t2[0], t2[1]);
+      gfx.lineTo(t1[0], t1[1]);
+      gfx.closePath();
+      gfx.fillPath();
+    }
+
+    // 8) Top of the wall — bright stone ring (the rampart walkway)
     gfx.fillStyle(innerColor, 1);
-    this.fillPolygon(gfx, topPoly);
+    this.fillRing(gfx, outerTop, innerTop);
 
-    // 6) Top highlight rim
-    gfx.lineStyle(1.5 * DPR, topColor, 0.9);
-    this.strokePolygon(gfx, topPoly);
+    // 9) Bright outer rim highlight on top of wall
+    gfx.lineStyle(1.2 * DPR, topColor, 0.9);
+    this.strokePolygon(gfx, outerTop);
 
-    // 7) Original border (slightly muted under the wall)
-    gfx.lineStyle(borderWidth, borderColor, 0.9);
-    this.strokePolygon(gfx, polygon);
-
-    // 8) Battlements for level 2 walls — notches along the top rim
+    // 10) Battlements for level 2 walls — notches along the outer top rim
     if (isL2 && healthPct > 0.3) {
-      this.drawBattlements(gfx, topPoly, topColor);
+      this.drawBattlements(gfx, outerTop, topColor);
+    }
+  }
+
+  /** Inset a polygon inward by `dist` pixels along each vertex's outward normal. */
+  private insetPolygon(polygon: [number, number][], dist: number): [number, number][] {
+    const center = this.polyCentroid(polygon);
+    return polygon.map(([x, y]) => {
+      const dx = x - center[0];
+      const dy = y - center[1];
+      const len = Math.hypot(dx, dy) || 1;
+      return [x - (dx / len) * dist, y - (dy / len) * dist] as [number, number];
+    });
+  }
+
+  /** Fill the ring between an outer and inner polygon (assumed same vertex count). */
+  private fillRing(
+    gfx: Phaser.GameObjects.Graphics,
+    outer: [number, number][],
+    inner: [number, number][],
+  ): void {
+    for (let i = 0; i < outer.length; i++) {
+      const j = (i + 1) % outer.length;
+      gfx.beginPath();
+      gfx.moveTo(outer[i][0], outer[i][1]);
+      gfx.lineTo(outer[j][0], outer[j][1]);
+      gfx.lineTo(inner[j][0], inner[j][1]);
+      gfx.lineTo(inner[i][0], inner[i][1]);
+      gfx.closePath();
+      gfx.fillPath();
     }
   }
 
@@ -626,51 +726,31 @@ export class MapScene extends Phaser.Scene {
       const def = this.gsm.getDefenseBonus(stateId);
       const defStr = def !== 1.0 ? ` | def ×${def}` : "";
 
-      if (this.mode === "build" && this.selectedStateId) {
-        const existing = this.gsm.getRailway(this.selectedStateId, stateId);
-        if (existing) {
-          this.infoText.setText(`${vis.data.name} | Rail already connected`);
-        } else if (this.gsm.getOwner(stateId) === "player") {
-          this.infoText.setText(`${vis.data.name} | Build rail — costs 5 units`);
-        } else {
-          this.infoText.setText(`${vis.data.name} | Must own this state to build rail`);
-        }
-        return;
-      }
-
       const genRate = this.logicTick.getGenRate(stateId);
       const genStr = genRate > 0 ? ` | +${genRate.toFixed(1)}/s` : "";
       const bonus = stateBonuses[stateId];
       const bonusStr = bonus ? ` | ${bonus.description}` : "";
-
-      // Show railway info
-      const rails = this.gsm.getRailwaysForState(stateId);
-      const railStr = rails.length > 0
-        ? ` | ${rails.length} rail${rails.length > 1 ? "s" : ""}`
-        : "";
 
       // Show wall info
       const wallLevel = this.gsm.getWallLevel(stateId);
       const wallHealth = this.gsm.getWallHealth(stateId);
       const wallStr = wallLevel > 0 ? ` | Wall L${wallLevel} (${wallHealth}hp)` : "";
 
-      this.infoText.setText(`${vis.data.name} | ${owner} | ${units} units${defStr}${genStr}${bonusStr}${railStr}${wallStr}`);
+      this.infoText.setText(`${vis.data.name} | ${owner} | ${units} units${defStr}${genStr}${bonusStr}${wallStr}`);
     } else {
       this.updateInfoDefault();
     }
   }
 
-  private onPointerDownState(stateId: string, _pointer: Phaser.Input.Pointer): void {
+  private onPointerDownState(stateId: string, pointer: Phaser.Input.Pointer): void {
     this.stateWasHit = true; // prevent camera pan when tapping a state
     sound.unlock(); // user gesture unlocks audio context
-    if (this.mode === "build") {
-      this.onClickStateBuildMode(stateId);
-      return;
-    }
-    if (this.mode === "bomb") {
-      this.onClickStateBombMode(stateId);
-      return;
-    }
+
+    // Block state interaction while paused
+    if (this.isPaused) return;
+
+    // Tapping a state always closes any open menu (long-press will reopen if held).
+    this.closeStateMenu();
 
     // Double-tap detection: fortify walls
     const now = Date.now();
@@ -688,6 +768,23 @@ export class MapScene extends Phaser.Scene {
     this.lastTapStateId = stateId;
     this.lastTapTime = now;
 
+    // Long-press on an owned state opens the action menu (planes etc.)
+    if (this.gsm.getOwner(stateId) === "player") {
+      this.longPressStartX = pointer.x;
+      this.longPressStartY = pointer.y;
+      if (this.longPressTimer !== null) window.clearTimeout(this.longPressTimer);
+      this.longPressTimer = window.setTimeout(() => {
+        this.longPressTimer = null;
+        // Cancel any in-progress drag setup so the menu takes over.
+        this.isDragging = false;
+        this.dragSourceId = null;
+        this.dragLineGfx.clear();
+        this.selectedStateId = null;
+        this.redrawAll();
+        this.openStateMenu(stateId);
+      }, LONG_PRESS_MS);
+    }
+
     // If we already have a selected state and click a target, execute immediately (click flow)
     if (this.selectedStateId !== null && stateId !== this.selectedStateId) {
       if (this.isValidTarget(stateId)) {
@@ -696,7 +793,8 @@ export class MapScene extends Phaser.Scene {
       }
     }
 
-    // Start drag from an owned state
+    // Start drag from an owned state (drag-to-move). The long-press timer
+    // above can override this if the user holds still long enough.
     if (this.gsm.getOwner(stateId) === "player" && this.gsm.getUnits(stateId) > 1) {
       this.dragSourceId = stateId;
       this.isDragging = true;
@@ -704,7 +802,7 @@ export class MapScene extends Phaser.Scene {
       this.redrawAll();
       const vis = this.visuals.get(stateId)!;
       const units = this.gsm.getUnits(stateId);
-      const fortifyHint = IS_MOBILE ? " | double-tap to fortify" : " | double-click to fortify";
+      const fortifyHint = IS_MOBILE ? " | double-tap fortify | hold for menu" : " | double-click fortify | hold for menu";
       this.infoText.setText(`${vis.data.name} selected (${units} units) — drag to target${fortifyHint}`);
       return;
     }
@@ -715,6 +813,13 @@ export class MapScene extends Phaser.Scene {
     }
 
     this.deselect();
+  }
+
+  private cancelLongPress(): void {
+    if (this.longPressTimer !== null) {
+      window.clearTimeout(this.longPressTimer);
+      this.longPressTimer = null;
+    }
   }
 
   private fortifyState(stateId: string): void {
@@ -734,57 +839,19 @@ export class MapScene extends Phaser.Scene {
     this.redrawAll();
   }
 
-  private onClickStateBombMode(stateId: string): void {
-    const owner = this.gsm.getOwner(stateId);
-    const vis = this.visuals.get(stateId);
-    if (!vis) return;
-
-    // Tap own state: build a plane (if affordable) or select an existing plane.
-    if (owner === "player") {
-      const existing = this.gsm.getPlanesAt(stateId);
-      if (existing.length > 0) {
-        // Select / deselect
-        if (this.selectedPlaneHomeId === stateId) {
-          this.selectedPlaneHomeId = null;
-          this.infoText.setText(`Plane deselected`);
-        } else {
-          this.selectedPlaneHomeId = stateId;
-          this.infoText.setText(`${vis.data.name} plane selected (${existing[0].bombsLeft} bombs) — tap any enemy state to bomb it`);
-        }
-        this.redrawAll();
-        return;
-      }
-      if (!AERIAL_STATES.has(stateId)) {
-        this.infoText.setText(`Planes can only be built in aerial states: CA TX FL WA IL NY`);
-        return;
-      }
-      const result = this.gsm.producePlane(stateId);
-      this.infoText.setText(result.message);
-      if (result.success) {
-        this.selectedPlaneHomeId = stateId;
-      }
-      this.redrawAll();
+  /** Drop a bomb from a plane home state to a target enemy state, with an explosion. */
+  private dropPlaneBomb(homeId: string, targetId: string): void {
+    const fromVis = this.visuals.get(homeId);
+    const toVis = this.visuals.get(targetId);
+    if (!fromVis || !toVis) return;
+    if (this.gsm.getPlanesAt(homeId).length === 0) {
+      this.infoText.setText("No plane at this state");
       return;
     }
 
-    // Tap enemy/neutral state: must have a selected plane to bomb it
-    if (!this.selectedPlaneHomeId) {
-      this.infoText.setText(`Tap an owned aerial state first to build (cost ${PLANE_COST_UNITS}) or select a plane`);
-      return;
-    }
-    const homeId = this.selectedPlaneHomeId;
-    const bomberVis = this.visuals.get(homeId);
-    if (!bomberVis) return;
-
-    // Fly to target, bomb, fly back (if plane still exists)
-    this.animateBomb(bomberVis, vis, () => {
-      const result = this.gsm.dropBomb(homeId, stateId);
+    this.animateBomb(fromVis, toVis, () => {
+      const result = this.gsm.dropBomb(homeId, targetId);
       this.infoText.setText(result.message);
-      // If plane still exists, animate it returning home (visual only)
-      const stillThere = this.gsm.getPlanesAt(homeId).length > 0;
-      if (!stillThere) {
-        this.selectedPlaneHomeId = null;
-      }
       this.redrawAll();
     });
   }
@@ -801,8 +868,26 @@ export class MapScene extends Phaser.Scene {
     const dist = Math.hypot(tx - sx, ty - sy);
     const duration = Math.max(500, Math.min(1400, dist * 1.8));
 
-    const bomb = this.add.circle(sx, sy, 6 * DPR, 0x111827, 1).setStrokeStyle(2 * DPR, 0xfbbf24).setDepth(8);
-    // Arc the bomb upward via tween chain
+    // Plane sprite that flies the bomb in (simple triangle).
+    const plane = this.add.triangle(sx, sy, 0, -10 * DPR, 9 * DPR, 8 * DPR, -9 * DPR, 8 * DPR, 0xfef9c3, 1)
+      .setStrokeStyle(1.5 * DPR, 0x111827)
+      .setDepth(8);
+    const angle = Math.atan2(ty - sy, tx - sx);
+    plane.setRotation(angle + Math.PI / 2);
+
+    // The bomb itself (a small dark circle with yellow rim).
+    const bomb = this.add.circle(sx, sy, 5 * DPR, 0x111827, 1)
+      .setStrokeStyle(2 * DPR, 0xfbbf24)
+      .setDepth(8);
+
+    // Fly the plane straight to the target.
+    this.tweens.add({
+      targets: plane,
+      x: tx,
+      y: ty,
+      duration,
+      ease: "Sine.easeIn",
+    });
     this.tweens.add({
       targets: bomb,
       x: tx,
@@ -811,64 +896,90 @@ export class MapScene extends Phaser.Scene {
       ease: "Sine.easeIn",
       onComplete: () => {
         bomb.destroy();
-        // Explosion: expanding ring + flash
-        const ring = this.add.circle(tx, ty, 8 * DPR, 0xfbbf24, 0.8).setDepth(9);
-        const flash = this.add.circle(tx, ty, 18 * DPR, 0xffffff, 0.6).setDepth(9);
-        this.tweens.add({
-          targets: ring,
-          scale: 5,
-          alpha: 0,
-          duration: 500,
-          ease: "Quad.easeOut",
-          onComplete: () => ring.destroy(),
-        });
-        this.tweens.add({
-          targets: flash,
-          alpha: 0,
-          scale: 2.2,
-          duration: 380,
-          ease: "Quad.easeOut",
-          onComplete: () => flash.destroy(),
-        });
+        plane.destroy();
+        this.spawnExplosion(tx, ty);
         onComplete();
       },
     });
   }
 
-  private onClickStateBuildMode(stateId: string): void {
-    if (this.selectedStateId === null) {
-      // Select source state for building
-      if (this.gsm.getOwner(stateId) === "player") {
-        this.selectedStateId = stateId;
-        this.redrawAll();
-        const vis = this.visuals.get(stateId)!;
-        this.infoText.setText(`${vis.data.name} — tap any other state you own to build a rail`);
-      }
-      return;
+  /** A multi-layer explosion: white flash, yellow fireball, orange shockwave, smoke ring, sparks. */
+  private spawnExplosion(x: number, y: number): void {
+    // Bright initial flash
+    const flash = this.add.circle(x, y, 22 * DPR, 0xffffff, 0.95).setDepth(9);
+    this.tweens.add({
+      targets: flash,
+      scale: 2.4,
+      alpha: 0,
+      duration: 220,
+      ease: "Quad.easeOut",
+      onComplete: () => flash.destroy(),
+    });
+
+    // Yellow / orange fireball
+    const fire = this.add.circle(x, y, 16 * DPR, 0xfbbf24, 0.95).setDepth(9);
+    this.tweens.add({
+      targets: fire,
+      scale: 3.5,
+      alpha: 0,
+      duration: 600,
+      ease: "Cubic.easeOut",
+      onComplete: () => fire.destroy(),
+    });
+    const inner = this.add.circle(x, y, 10 * DPR, 0xf97316, 1).setDepth(9);
+    this.tweens.add({
+      targets: inner,
+      scale: 3,
+      alpha: 0,
+      duration: 520,
+      ease: "Cubic.easeOut",
+      onComplete: () => inner.destroy(),
+    });
+
+    // Outer shockwave ring (stroked, expands outward)
+    const ring = this.add.circle(x, y, 12 * DPR, 0xffffff, 0).setStrokeStyle(3 * DPR, 0xfde68a, 0.9).setDepth(9);
+    this.tweens.add({
+      targets: ring,
+      scale: 6,
+      alpha: 0,
+      duration: 700,
+      ease: "Quad.easeOut",
+      onComplete: () => ring.destroy(),
+    });
+
+    // Dark smoke ring lingers
+    const smoke = this.add.circle(x, y, 18 * DPR, 0x1f2937, 0.55).setDepth(9);
+    this.tweens.add({
+      targets: smoke,
+      scale: 2.6,
+      alpha: 0,
+      duration: 900,
+      ease: "Quad.easeOut",
+      onComplete: () => smoke.destroy(),
+    });
+
+    // Spark shrapnel — a handful of small bright dots flying outward
+    const sparkCount = 10;
+    for (let i = 0; i < sparkCount; i++) {
+      const a = (Math.PI * 2 * i) / sparkCount + Math.random() * 0.3;
+      const dist = (28 + Math.random() * 22) * DPR;
+      const spark = this.add.circle(x, y, 2 * DPR, 0xfde68a, 1).setDepth(9);
+      this.tweens.add({
+        targets: spark,
+        x: x + Math.cos(a) * dist,
+        y: y + Math.sin(a) * dist,
+        alpha: 0,
+        duration: 500 + Math.random() * 200,
+        ease: "Quad.easeOut",
+        onComplete: () => spark.destroy(),
+      });
     }
 
-    if (stateId === this.selectedStateId) {
-      this.deselect();
-      return;
-    }
-
-    // Try to build railway between any two owned states
-    const result = this.gsm.buildRailway(this.selectedStateId, stateId);
-    this.infoText.setText(result.message);
-    this.deselect();
-    this.redrawAll();
+    sound.bomb();
   }
 
   private isValidTarget(targetId: string): boolean {
     if (!this.selectedStateId) return false;
-
-    if (this.mode === "build") {
-      // In build mode, any other owned state without an existing rail is valid
-      if (this.gsm.getOwner(targetId) !== "player") return false;
-      const existing = this.gsm.getRailway(this.selectedStateId, targetId);
-      return !existing;
-    }
-
     return this.gsm.canMove(this.selectedStateId, targetId)
       || this.gsm.canAttack(this.selectedStateId, targetId);
   }
@@ -1083,15 +1194,14 @@ export class MapScene extends Phaser.Scene {
   }
 
   private updateInfoDefault(): void {
-    if (this.mode === "bomb") {
-      this.infoText.setText(`BOMB MODE — tap an aerial state (CA TX FL WA IL NY) to build/select a plane (costs ${PLANE_COST_UNITS}), then tap any enemy state`);
-    } else if (this.mode === "build") {
-      this.infoText.setText("BUILD MODE — select a state to build/upgrade railways");
+    if (this.isPaused) {
+      this.infoText.setText("PAUSED");
     } else if (this.selectedStateId) {
       const vis = this.visuals.get(this.selectedStateId)!;
-      this.infoText.setText(`${vis.data.name} selected — tap adjacent state`);
+      this.infoText.setText(`${vis.data.name} selected — drag to target`);
     } else {
-      this.infoText.setText("Select a state (blue) — double-tap to fortify");
+      const hint = IS_MOBILE ? "tap to select • hold for menu • double-tap fortify" : "click to select • hold for menu • double-click fortify";
+      this.infoText.setText(hint);
     }
   }
 
@@ -1100,11 +1210,231 @@ export class MapScene extends Phaser.Scene {
     const pUnits = this.logicTick.countUnits("player");
     const aStates = this.logicTick.countStates("ai");
     const aUnits = this.logicTick.countUnits("ai");
-    const builtRails = this.gsm.railways.length;
-    const railStr = builtRails > 0 ? `  |  Rails: ${builtRails}` : "";
     this.statsText.setText(
-      `You: ${pStates} states, ${pUnits} units  |  AI: ${aStates} states, ${aUnits} units${railStr}`
+      `You: ${pStates} states, ${pUnits} units  |  AI: ${aStates} states, ${aUnits} units`
     );
+  }
+
+  // ── State Action Menu (long-press) ──
+
+  private openStateMenu(stateId: string): void {
+    if (this.gsm.getOwner(stateId) !== "player") return;
+    this.closeStateMenu();
+
+    const vis = this.visuals.get(stateId);
+    if (!vis) return;
+
+    const cx = vis.centroid[0] * DPR;
+    const cy = vis.centroid[1] * DPR;
+
+    // Layout
+    const padX = 12 * DPR;
+    const padY = 12 * DPR;
+    const lineH = 19 * DPR;
+    const planeRowH = 56 * DPR;
+    const titleSize = Math.round(15 * DPR);
+    const lineSize = Math.round(13 * DPR);
+    const width = 210 * DPR;
+
+    const planes = this.gsm.getPlanesAt(stateId);
+    const canBuildPlane = AERIAL_STATES.has(stateId)
+      && planes.length === 0
+      && this.gsm.getUnits(stateId) > PLANE_COST_UNITS;
+    const showPlaneRow = planes.length > 0 || AERIAL_STATES.has(stateId);
+
+    const headerLines = 4; // title + growth + defense + planes-label
+    const height = padY * 2 + lineH * headerLines + (showPlaneRow ? planeRowH : 0);
+
+    // Position the menu near the state (above by default, flip below if too high).
+    let mx = cx;
+    let my = cy - height / 2 - 30 * DPR;
+    if (my - height / 2 < 30 * DPR) my = cy + height / 2 + 30 * DPR;
+
+    const container = this.add.container(mx, my).setDepth(15);
+
+    // Background panel — interactive so taps inside the menu don't dismiss it.
+    const bg = this.add.rectangle(0, 0, width, height, 0x111827, 0.96)
+      .setStrokeStyle(2 * DPR, 0xfbbf24, 0.9)
+      .setInteractive();
+    bg.on("pointerdown", (p: Phaser.Input.Pointer) => {
+      p.event.stopPropagation();
+      this.stateWasHit = true;
+    });
+    container.add(bg);
+
+    const lines: Phaser.GameObjects.Text[] = [];
+    let ty = -height / 2 + padY;
+
+    const title = this.add.text(0, ty, vis.data.name, {
+      fontSize: `${titleSize}px`,
+      color: "#fbbf24",
+      fontFamily: "'Segoe UI', Arial, sans-serif",
+      fontStyle: "bold",
+    }).setOrigin(0.5, 0);
+    lines.push(title);
+    ty += lineH;
+
+    const genRate = this.logicTick.getGenRate(stateId);
+    const growth = this.add.text(-width / 2 + padX, ty, `Growth:  +${genRate.toFixed(2)}/s`, {
+      fontSize: `${lineSize}px`,
+      color: "#e5e7eb",
+      fontFamily: "'Segoe UI', Arial, sans-serif",
+    }).setOrigin(0, 0);
+    lines.push(growth);
+    ty += lineH;
+
+    const defBonus = this.gsm.getDefenseBonus(stateId);
+    const wallLevel = this.gsm.getWallLevel(stateId);
+    const wallHealth = this.gsm.getWallHealth(stateId);
+    const wallStr = wallLevel > 0 ? ` | wall L${wallLevel} ${wallHealth}hp` : "";
+    const defense = this.add.text(-width / 2 + padX, ty, `Defense: ×${defBonus.toFixed(1)}${wallStr}`, {
+      fontSize: `${lineSize}px`,
+      color: "#e5e7eb",
+      fontFamily: "'Segoe UI', Arial, sans-serif",
+    }).setOrigin(0, 0);
+    lines.push(defense);
+    ty += lineH;
+
+    const planeLabel = this.add.text(-width / 2 + padX, ty, `Planes:  ${planes.length}`, {
+      fontSize: `${lineSize}px`,
+      color: "#e5e7eb",
+      fontFamily: "'Segoe UI', Arial, sans-serif",
+    }).setOrigin(0, 0);
+    lines.push(planeLabel);
+    ty += lineH;
+
+    container.add(lines);
+
+    // Plane drag icons row
+    const planeIcons: Phaser.GameObjects.Container[] = [];
+    if (planes.length > 0) {
+      // Show one draggable plane icon per plane stationed here
+      const iconSize = 24 * DPR;
+      const spacing = iconSize + 14 * DPR;
+      const total = planes.length;
+      const startX = -((total - 1) * spacing) / 2;
+      const iconY = ty + 16 * DPR;
+      for (let i = 0; i < total; i++) {
+        const px = startX + i * spacing;
+        const icon = this.makePlaneIcon(px, iconY, iconSize, planes[i].bombsLeft, stateId);
+        container.add(icon);
+        planeIcons.push(icon);
+      }
+      const hint = this.add.text(0, ty + planeRowH - 6 * DPR, "drag plane → enemy state", {
+        fontSize: `${Math.round(10 * DPR)}px`,
+        color: "#94a3b8",
+        fontFamily: "'Segoe UI', Arial, sans-serif",
+      }).setOrigin(0.5, 1);
+      container.add(hint);
+    } else if (AERIAL_STATES.has(stateId)) {
+      // Build plane button
+      const btnLabel = canBuildPlane
+        ? `Build plane (−${PLANE_COST_UNITS})`
+        : `Need ${PLANE_COST_UNITS + 1}+ units`;
+      const btn = this.add.text(0, ty + planeRowH / 2, btnLabel, {
+        fontSize: `${Math.round(12 * DPR)}px`,
+        color: canBuildPlane ? "#0f172a" : "#475569",
+        backgroundColor: canBuildPlane ? "#fbbf24" : "#1f2937",
+        fontFamily: "'Segoe UI', Arial, sans-serif",
+        fontStyle: "bold",
+        padding: { x: 10 * DPR, y: 5 * DPR },
+      }).setOrigin(0.5);
+      if (canBuildPlane) {
+        btn.setInteractive({ useHandCursor: true });
+        btn.on("pointerdown", (p: Phaser.Input.Pointer) => {
+          p.event.stopPropagation();
+          this.stateWasHit = true; // prevent the scene-level handler from closing the menu
+          const result = this.gsm.producePlane(stateId);
+          this.infoText.setText(result.message);
+          this.closeStateMenu();
+          this.redrawAll();
+          // Reopen so player sees the new plane and can drag it.
+          if (result.success) this.openStateMenu(stateId);
+        });
+      }
+      container.add(btn);
+    }
+
+    this.stateMenu = { stateId, container, planeIcons };
+  }
+
+  private makePlaneIcon(x: number, y: number, size: number, bombsLeft: number, sourceStateId: string): Phaser.GameObjects.Container {
+    const c = this.add.container(x, y);
+    const bg = this.add.circle(0, 0, size * 0.7, 0x1f2937, 1).setStrokeStyle(2 * DPR, 0xfbbf24);
+    const tri = this.add.triangle(0, 0, 0, -size * 0.5, size * 0.45, size * 0.4, -size * 0.45, size * 0.4, 0xfef9c3, 1)
+      .setStrokeStyle(1 * DPR, 0x111827);
+    const ammo = this.add.text(0, size * 0.55, `${bombsLeft}`, {
+      fontSize: `${Math.round(11 * DPR)}px`,
+      color: "#fbbf24",
+      fontFamily: "'Segoe UI', Arial, sans-serif",
+      fontStyle: "bold",
+      stroke: "#000000",
+      strokeThickness: 2 * DPR,
+    }).setOrigin(0.5, 0);
+    c.add([bg, tri, ammo]);
+    c.setSize(size * 1.4, size * 1.4);
+    c.setInteractive(new Phaser.Geom.Circle(0, 0, size * 0.8), Phaser.Geom.Circle.Contains);
+
+    // On pointerdown, start a plane drag (intercept before the menu close handler).
+    c.on("pointerdown", (pointer: Phaser.Input.Pointer) => {
+      pointer.event.stopPropagation();
+      this.stateWasHit = true;
+      this.isDraggingPlane = true;
+      this.planeDragSourceId = sourceStateId;
+      this.infoText.setText("Drop plane on an enemy state to bomb it");
+      this.drawPlaneDragLine(pointer);
+    });
+    return c;
+  }
+
+  private drawPlaneDragLine(pointer: Phaser.Input.Pointer): void {
+    this.planeDragLineGfx.clear();
+    if (!this.planeDragSourceId) return;
+    const fromVis = this.visuals.get(this.planeDragSourceId);
+    if (!fromVis) return;
+
+    const sx = fromVis.centroid[0] * DPR;
+    const sy = fromVis.centroid[1] * DPR;
+    let ex = pointer.worldX;
+    let ey = pointer.worldY;
+
+    // Snap to enemy/neutral state if hovering one
+    const hoveredId = this.findStateAtPoint(pointer.worldX, pointer.worldY);
+    let valid = false;
+    if (hoveredId && hoveredId !== this.planeDragSourceId && this.gsm.getOwner(hoveredId) !== "player") {
+      const toVis = this.visuals.get(hoveredId)!;
+      ex = toVis.centroid[0] * DPR;
+      ey = toVis.centroid[1] * DPR;
+      valid = true;
+    }
+
+    const lineColor = valid ? 0xfbbf24 : 0x9ca3af;
+    const lineAlpha = valid ? 0.95 : 0.5;
+    this.planeDragLineGfx.lineStyle(5 * DPR, lineColor, lineAlpha);
+    this.planeDragLineGfx.beginPath();
+    this.planeDragLineGfx.moveTo(sx, sy);
+    this.planeDragLineGfx.lineTo(ex, ey);
+    this.planeDragLineGfx.strokePath();
+
+    // Crosshair on valid target
+    if (valid) {
+      const r = 14 * DPR;
+      this.planeDragLineGfx.lineStyle(2 * DPR, lineColor, 1);
+      this.planeDragLineGfx.strokeCircle(ex, ey, r);
+      this.planeDragLineGfx.beginPath();
+      this.planeDragLineGfx.moveTo(ex - r * 1.4, ey);
+      this.planeDragLineGfx.lineTo(ex + r * 1.4, ey);
+      this.planeDragLineGfx.moveTo(ex, ey - r * 1.4);
+      this.planeDragLineGfx.lineTo(ex, ey + r * 1.4);
+      this.planeDragLineGfx.strokePath();
+    }
+  }
+
+  private closeStateMenu(): void {
+    if (!this.stateMenu) return;
+    this.stateMenu.container.destroy(true);
+    this.stateMenu = null;
+    this.planeDragLineGfx.clear();
   }
 
   // ── Game Event Feed ──

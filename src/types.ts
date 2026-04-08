@@ -18,12 +18,6 @@ export interface CombatResult {
   remainingDefenders: number;
 }
 
-export interface RailwayState {
-  from: string;
-  to: string;
-  owner: Owner;   // who built/controls it
-}
-
 export interface UnitMoveEvent {
   from: string;
   to: string;
