@@ -1,16 +1,15 @@
-import { GameState, Owner, CombatResult, RailwayState, MoveListener, UnitMoveEvent, GameEvent, GameEventListener, Plane } from "../types";
+import { GameState, Owner, CombatResult, MoveListener, UnitMoveEvent, GameEvent, GameEventListener, Plane } from "../types";
 import { stateData } from "../data/states";
 import { adjacencyGraph } from "../data/adjacency";
 import { stateDefenseBonus } from "../data/stateDefense";
-import { RAIL_BUILD_COST } from "../data/railways";
 import { sound } from "../audio/SoundManager";
 
 // States with aerial bombing capability.
 export const AERIAL_STATES = new Set(["CA", "TX", "FL", "WA", "IL", "NY"]);
-// Bomb tuning
-const BOMB_WALL_DAMAGE = 50;        // planes shred walls
-const BOMB_UNIT_KILL_BASE = 2;
-const BOMB_UNIT_KILL_PCT = 0.25;
+// Bomb tuning — planes target walls heavily; units take collateral damage.
+const BOMB_WALL_DAMAGE = 60;        // planes shred walls
+const BOMB_UNIT_KILL_BASE = 1;      // collateral, not the main effect
+const BOMB_UNIT_KILL_PCT = 0.12;    // ~12% of garrison killed
 const BOMB_OVERDAMAGE_COOLDOWN = 25; // ticks
 
 // Plane tuning — planes are expensive to acquire but very destructive
@@ -35,7 +34,6 @@ for (const s of stateData) stateNameMap[s.id] = s.name;
 
 export class GameStateManager {
   public state: GameState = {};
-  public railways: RailwayState[] = [];
   public planes: Plane[] = [];
   private nextPlaneId = 1;
   private moveListeners: MoveListener[] = [];
@@ -380,7 +378,7 @@ export class GameStateManager {
     };
   }
 
-  /** Check if fromId can attack toId — adjacency or railway */
+  /** Check if fromId can attack toId — must be adjacent. */
   canAttack(fromId: string, toId: string): boolean {
     const src = this.state[fromId];
     const dst = this.state[toId];
@@ -389,8 +387,7 @@ export class GameStateManager {
     if (src.units <= 1) return false;
     if (dst.bombCooldown > 0) return false;
     const neighbors = adjacencyGraph[fromId] ?? [];
-    if (neighbors.includes(toId)) return true;
-    return this.hasRailway(fromId, toId, src.owner);
+    return neighbors.includes(toId);
   }
 
   /** Check if fromId can move units to toId (friendly) — any owned state to any owned state */
@@ -401,51 +398,5 @@ export class GameStateManager {
     if (src.owner !== dst.owner) return false;
     if (src.units <= 1) return false;
     return true;
-  }
-
-  // ── Railway methods ──
-
-  /** Find a railway between two states (direction-agnostic) */
-  getRailway(a: string, b: string): RailwayState | undefined {
-    return this.railways.find(
-      r => (r.from === a && r.to === b) || (r.from === b && r.to === a)
-    );
-  }
-
-  /** Check if a railway connects two states for a given owner */
-  hasRailway(fromId: string, toId: string, owner: Owner): boolean {
-    const rail = this.getRailway(fromId, toId);
-    if (!rail) return false;
-    return rail.owner === owner;
-  }
-
-  /** Build a railway between two owned states. Costs units from source. */
-  buildRailway(stateId: string, targetId: string): { success: boolean; message: string } {
-    const src = this.state[stateId];
-    const dst = this.state[targetId];
-    if (!src || !dst) return { success: false, message: "Invalid state" };
-
-    // Check if rail already exists
-    const existing = this.getRailway(stateId, targetId);
-    if (existing) return { success: false, message: "Rail already built here" };
-
-    // Must own both states
-    if (dst.owner !== src.owner) {
-      return { success: false, message: "Must own both states to build a rail" };
-    }
-
-    if (src.units <= RAIL_BUILD_COST) {
-      return { success: false, message: `Need ${RAIL_BUILD_COST + 1}+ units (have ${src.units})` };
-    }
-
-    src.units -= RAIL_BUILD_COST;
-    this.railways.push({ from: stateId, to: targetId, owner: src.owner });
-
-    return { success: true, message: `Rail built to ${targetId} (−${RAIL_BUILD_COST} units)` };
-  }
-
-  /** Get all railways involving a state */
-  getRailwaysForState(stateId: string): RailwayState[] {
-    return this.railways.filter(r => r.from === stateId || r.to === stateId);
   }
 }
