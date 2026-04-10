@@ -15,13 +15,13 @@ import { stateBonuses } from "../data/stateBonuses";
 const AI_OWNER = "ai" as const;
 const PLAYER_OWNER = "player" as const;
 
-const ATTACK_THRESHOLD = 2.5;    // attack if we have 2.5× the effective defense (more cautious)
-const CONSOLIDATE_THRESHOLD = 12; // interior states above this send units forward (slower consolidation)
-const WALL_BUILD_THRESHOLD = 25; // fortify borders when 25+ units
+const ATTACK_THRESHOLD = 3.2;    // attack only with a clear 3.2× advantage (cautious)
+const CONSOLIDATE_THRESHOLD = 16; // interior states above this send units forward (slow)
+const WALL_BUILD_THRESHOLD = 30; // fortify borders when 30+ units
 
-// Rubber-banding (reduced)
-const RUBBERBAND_CHECK_INTERVAL = 15; // check less frequently
-const RUBBERBAND_MAX_BONUS = 0.15;    // halved max extra gen per state per tick
+// Rubber-banding (mild)
+const RUBBERBAND_CHECK_INTERVAL = 20; // check infrequently
+const RUBBERBAND_MAX_BONUS = 0.08;    // very mild extra gen per state per tick
 
 export class AIController {
   private gsm: GameStateManager;
@@ -61,7 +61,7 @@ export class AIController {
     for (const id of aiStates) {
       if (!AERIAL_STATES.has(id)) continue;
       if (this.gsm.getPlanesAt(id).length > 0) continue;
-      if (this.gsm.getUnits(id) <= PLANE_COST_UNITS + 5) continue;
+      if (this.gsm.getUnits(id) <= PLANE_COST_UNITS + 15) continue; // need cushion
       this.gsm.producePlane(id);
       break;
     }
@@ -137,7 +137,7 @@ export class AIController {
       if (this.isBorderState(stateId)) continue;
 
       // Find the weakest AI neighbor that's a border state
-      const neighbors = adjacencyGraph[stateId] ?? [];
+      const neighbors = (adjacencyGraph[stateId] ?? []).filter(n => this.gsm.activeStates.has(n));
       let weakestBorder: string | null = null;
       let weakestUnits = Infinity;
 
@@ -181,8 +181,8 @@ export class AIController {
       if (units < WALL_BUILD_THRESHOLD) continue;
       if (!this.isBorderState(stateId)) continue;
 
-      // Only fortify if facing player-owned neighbors
-      const neighbors = adjacencyGraph[stateId] ?? [];
+      // Only fortify if facing player-owned neighbors (within active level)
+      const neighbors = (adjacencyGraph[stateId] ?? []).filter(n => this.gsm.activeStates.has(n));
       const facesPlayer = neighbors.some(n => this.gsm.getOwner(n) === PLAYER_OWNER);
       if (!facesPlayer) continue;
 
@@ -246,6 +246,7 @@ export class AIController {
   private getAttackableNeighbors(stateId: string): string[] {
     const neighbors = adjacencyGraph[stateId] ?? [];
     return neighbors.filter(n => {
+      if (!this.gsm.activeStates.has(n)) return false;
       const owner = this.gsm.getOwner(n);
       return owner !== AI_OWNER;
     });
@@ -253,7 +254,7 @@ export class AIController {
 
   private isBorderState(stateId: string): boolean {
     const neighbors = adjacencyGraph[stateId] ?? [];
-    return neighbors.some(n => this.gsm.getOwner(n) !== AI_OWNER);
+    return neighbors.some(n => this.gsm.activeStates.has(n) && this.gsm.getOwner(n) !== AI_OWNER);
   }
 
   private isStrategicState(stateId: string): boolean {

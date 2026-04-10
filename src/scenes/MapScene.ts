@@ -6,6 +6,7 @@ import { LogicTick } from "../state/LogicTick";
 import { Owner, CombatResult, UnitMoveEvent, GameEvent } from "../types";
 import { sound } from "../audio/SoundManager";
 import { AERIAL_STATES, PLANE_COST_UNITS } from "../state/GameStateManager";
+import { levels, LevelConfig } from "../data/levels";
 
 const DPR = Math.min(window.devicePixelRatio || 1, 2);
 const IS_MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
@@ -118,6 +119,12 @@ export class MapScene extends Phaser.Scene {
   private feedEvents: { message: string; owner: Owner; time: number }[] = [];
   private feedText!: Phaser.GameObjects.Text;
 
+  // Level progression
+  private currentLevelIndex = 0;
+  private currentLevel!: LevelConfig;
+  private victoryOverlay!: Phaser.GameObjects.Container;
+  private levelComplete = false;
+
   constructor() {
     super({ key: "MapScene" });
   }
@@ -125,17 +132,13 @@ export class MapScene extends Phaser.Scene {
   create(): void {
     this.cameras.main.setBackgroundColor(0x111827);
 
-    // On mobile, the game canvas matches the phone screen (set in main.ts).
-    // The map world is 1280×720 * DPR — larger than the viewport — so the
-    // camera shows a cropped, detailed view and the player pans to explore.
-    if (IS_MOBILE) {
-      const cam = this.cameras.main;
-      cam.setBounds(0, 0, 1280 * DPR, 720 * DPR);
-      // Start centered on California (player start) — left-center of map
-      cam.centerOn(300 * DPR, 400 * DPR);
-    }
+    const cam = this.cameras.main;
+    cam.setBounds(0, 0, 1280 * DPR, 720 * DPR);
 
-    this.gsm = new GameStateManager();
+    // ── Level setup ──
+    this.currentLevel = levels[this.currentLevelIndex];
+    this.levelComplete = false;
+    this.gsm = new GameStateManager(this.currentLevel);
 
     // Listen for AI/consolidation move events and animate them
     this.gsm.onMove((event: UnitMoveEvent) => {
@@ -153,8 +156,11 @@ export class MapScene extends Phaser.Scene {
     this.dragLineGfx = this.add.graphics().setDepth(7);
     this.planeDragLineGfx = this.add.graphics().setDepth(11);
 
+    const activeSet = this.gsm.activeStates;
+
     // Build visuals for each state
     for (const state of stateData) {
+      const isActive = activeSet.has(state.id);
       const centroid = this.computeBestCentroid(state.polygons);
       const cx = centroid[0] * DPR;
       const cy = centroid[1] * DPR;
@@ -164,15 +170,33 @@ export class MapScene extends Phaser.Scene {
         if (polygon.length < 3) continue;
 
         const gfx = this.add.graphics().setDepth(1);
-        const scaled = scaledPolygon(polygon);
-        const flatPoints: number[] = [];
-        for (const [x, y] of scaled) flatPoints.push(x, y);
-        const hitArea = new Phaser.Geom.Polygon(flatPoints);
 
-        gfx.setInteractive(hitArea, Phaser.Geom.Polygon.Contains);
-        gfx.on("pointerover", () => this.onHover(state.id, true));
-        gfx.on("pointerout", () => this.onHover(state.id, false));
-        gfx.on("pointerdown", (pointer: Phaser.Input.Pointer) => this.onPointerDownState(state.id, pointer));
+        if (isActive) {
+          const scaled = scaledPolygon(polygon);
+          const flatPoints: number[] = [];
+          for (const [x, y] of scaled) flatPoints.push(x, y);
+          const hitArea = new Phaser.Geom.Polygon(flatPoints);
+
+          gfx.setInteractive(hitArea, Phaser.Geom.Polygon.Contains);
+          gfx.on("pointerover", () => this.onHover(state.id, true));
+          gfx.on("pointerout", () => this.onHover(state.id, false));
+          gfx.on("pointerdown", (pointer: Phaser.Input.Pointer) => this.onPointerDownState(state.id, pointer));
+        } else {
+          // Draw inactive states as dark outlines for map context
+          const scaled = scaledPolygon(polygon);
+          gfx.fillStyle(0x1a1a2e, 0.5);
+          gfx.beginPath();
+          gfx.moveTo(scaled[0][0], scaled[0][1]);
+          for (let i = 1; i < scaled.length; i++) gfx.lineTo(scaled[i][0], scaled[i][1]);
+          gfx.closePath();
+          gfx.fillPath();
+          gfx.lineStyle(1 * DPR, 0x2d2d44, 0.4);
+          gfx.beginPath();
+          gfx.moveTo(scaled[0][0], scaled[0][1]);
+          for (let i = 1; i < scaled.length; i++) gfx.lineTo(scaled[i][0], scaled[i][1]);
+          gfx.closePath();
+          gfx.strokePath();
+        }
 
         gfxList.push(gfx);
       }
@@ -188,7 +212,7 @@ export class MapScene extends Phaser.Scene {
         stroke: "#0f172a",
         strokeThickness: 3.5 * DPR,
         shadow: { offsetX: 0, offsetY: 1 * DPR, color: "#000", blur: 2 * DPR, fill: true, stroke: true },
-      }).setOrigin(0.5).setDepth(3);
+      }).setOrigin(0.5).setDepth(3).setVisible(isActive);
 
       const unitText = this.add.text(cx, cy + 7 * DPR, "", {
         fontSize: `${unitSize}px`,
@@ -198,7 +222,7 @@ export class MapScene extends Phaser.Scene {
         stroke: "#0f172a",
         strokeThickness: 4.5 * DPR,
         shadow: { offsetX: 0, offsetY: 1 * DPR, color: "#000", blur: 3 * DPR, fill: true, stroke: true },
-      }).setOrigin(0.5).setDepth(3);
+      }).setOrigin(0.5).setDepth(3).setVisible(isActive);
 
       const planeText = this.add.text(cx, cy - 22 * DPR, "", {
         fontSize: `${Math.round(13 * DPR)}px`,
@@ -208,26 +232,39 @@ export class MapScene extends Phaser.Scene {
         stroke: "#0f172a",
         strokeThickness: 3.5 * DPR,
         shadow: { offsetX: 0, offsetY: 1 * DPR, color: "#000", blur: 2 * DPR, fill: true, stroke: true },
-      }).setOrigin(0.5).setDepth(3);
+      }).setOrigin(0.5).setDepth(3).setVisible(isActive);
 
       this.visuals.set(state.id, { data: state, gfxList, label, unitText, planeText, centroid });
     }
+
+    // ── Center camera on the active region ──
+    this.centerCameraOnRegion();
 
     // Screen dimensions (actual game canvas size)
     const screenW = Number(this.game.config.width);
     const screenH = Number(this.game.config.height);
 
-    // Info bar — fixed to viewport on mobile
-    const infoSize = IS_MOBILE ? Math.round(15 * DPR) : Math.round(18 * DPR);
-    const infoY = IS_MOBILE ? 6 * DPR : 14 * DPR;
+    // Level indicator (top-left)
+    this.add.text(10 * DPR, 6 * DPR,
+      `Level ${this.currentLevel.id}: ${this.currentLevel.name}`, {
+      fontSize: `${Math.round(14 * DPR)}px`,
+      color: "#fbbf24",
+      fontFamily: "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
+      fontStyle: "bold",
+      stroke: "#0f172a",
+      strokeThickness: 3 * DPR,
+    }).setOrigin(0, 0).setDepth(4).setScrollFactor(0);
+
+    // Info bar
+    const infoSize = IS_MOBILE ? Math.round(14 * DPR) : Math.round(16 * DPR);
+    const infoY = IS_MOBILE ? 24 * DPR : 32 * DPR;
     const infoCx = IS_MOBILE ? screenW / 2 : 640 * DPR;
-    this.infoText = this.add.text(infoCx, infoY, "Select one of your states (blue)", {
+    this.infoText = this.add.text(infoCx, infoY, "Conquer all states in this region!", {
       fontSize: `${infoSize}px`,
       color: "#ffffff",
       fontFamily: "'Segoe UI', Arial, sans-serif",
       wordWrap: { width: (IS_MOBILE ? screenW - 20 * DPR : 1200 * DPR) },
-    }).setOrigin(0.5, 0).setDepth(4);
-    if (IS_MOBILE) this.infoText.setScrollFactor(0);
+    }).setOrigin(0.5, 0).setDepth(4).setScrollFactor(0);
 
     // Stats display (bottom-right)
     const statsSize = IS_MOBILE ? Math.round(13 * DPR) : Math.round(14 * DPR);
@@ -238,8 +275,7 @@ export class MapScene extends Phaser.Scene {
       color: "#d1d5db",
       fontFamily: "'Segoe UI', Arial, sans-serif",
       align: "right",
-    }).setOrigin(1, 1).setDepth(4);
-    if (IS_MOBILE) this.statsText.setScrollFactor(0);
+    }).setOrigin(1, 1).setDepth(4).setScrollFactor(0);
 
     // Pause / Start button (bottom-left)
     const pauseSize = Math.round(14 * DPR);
@@ -250,14 +286,17 @@ export class MapScene extends Phaser.Scene {
       fontStyle: "bold",
       backgroundColor: "#1f2937",
       padding: { x: 8 * DPR, y: 5 * DPR },
-    }).setOrigin(0, 1).setDepth(4).setInteractive({ useHandCursor: true });
-    if (IS_MOBILE) this.pauseText.setScrollFactor(0);
+    }).setOrigin(0, 1).setDepth(4).setInteractive({ useHandCursor: true }).setScrollFactor(0);
 
     this.pauseText.on("pointerdown", () => this.togglePause());
 
     // Pause overlay (hidden until paused)
     this.pauseOverlay = this.buildPauseOverlay(screenW, screenH);
     this.pauseOverlay.setVisible(false);
+
+    // Victory overlay (hidden until won/lost)
+    this.victoryOverlay = this.buildVictoryOverlay(screenW, screenH);
+    this.victoryOverlay.setVisible(false);
 
     // Game event feed (fixed to viewport, above stats area)
     const feedY = IS_MOBILE ? screenH - 50 * DPR : screenH - 50 * DPR;
@@ -270,8 +309,7 @@ export class MapScene extends Phaser.Scene {
       lineSpacing: 4 * DPR,
       stroke: "#000000",
       strokeThickness: 2 * DPR,
-    }).setOrigin(0.5, 1).setDepth(10).setAlpha(0.85);
-    if (IS_MOBILE) this.feedText.setScrollFactor(0);
+    }).setOrigin(0.5, 1).setDepth(10).setAlpha(0.85).setScrollFactor(0);
 
     // Listen for game events (AI combat, fortify, etc.)
     this.gsm.onGameEvent((event: GameEvent) => {
@@ -404,10 +442,16 @@ export class MapScene extends Phaser.Scene {
       this.updateStats();
       this.updateFeed();
     });
+    this.logicTick.setVictoryCallback((winner: Owner) => {
+      this.onLevelEnd(winner);
+    });
     this.logicTick.start();
 
     this.redrawAll();
     this.updateStats();
+
+    // Show plane hint on levels that have aerial states
+    this.showPlaneHintIfNeeded();
   }
 
   // ── Pause ──
@@ -456,15 +500,166 @@ export class MapScene extends Phaser.Scene {
     return c;
   }
 
+  // ── Level Progression ──
+
+  /** Center the camera so all active states are nicely framed. */
+  private centerCameraOnRegion(): void {
+    const activeSet = this.gsm.activeStates;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const id of activeSet) {
+      const vis = this.visuals.get(id);
+      if (!vis) continue;
+      for (const poly of vis.data.polygons) {
+        for (const [x, y] of poly) {
+          minX = Math.min(minX, x * DPR);
+          minY = Math.min(minY, y * DPR);
+          maxX = Math.max(maxX, x * DPR);
+          maxY = Math.max(maxY, y * DPR);
+        }
+      }
+    }
+    const regionW = maxX - minX;
+    const regionH = maxY - minY;
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+
+    const screenW = Number(this.game.config.width);
+    const screenH = Number(this.game.config.height);
+    const pad = 60 * DPR;
+    const zoomX = screenW / (regionW + pad * 2);
+    const zoomY = screenH / (regionH + pad * 2);
+    const zoom = Math.min(zoomX, zoomY, 2.5);
+
+    const cam = this.cameras.main;
+    cam.setZoom(Math.max(zoom, MOBILE_MIN_ZOOM));
+    cam.centerOn(cx, cy);
+  }
+
+  /** Called when a side wins the level. */
+  private onLevelEnd(winner: Owner): void {
+    this.levelComplete = true;
+    this.deselect();
+    this.closeStateMenu();
+    this.cancelLongPress();
+
+    const screenW = Number(this.game.config.width);
+    const screenH = Number(this.game.config.height);
+
+    // Rebuild and show victory overlay with current result
+    if (this.victoryOverlay) this.victoryOverlay.destroy(true);
+    this.victoryOverlay = this.buildVictoryOverlay(screenW, screenH, winner);
+    this.victoryOverlay.setVisible(true);
+  }
+
+  private buildVictoryOverlay(
+    screenW: number, screenH: number, winner?: Owner,
+  ): Phaser.GameObjects.Container {
+    const cx = screenW / 2;
+    const cy = screenH / 2;
+    const c = this.add.container(cx, cy).setDepth(25).setScrollFactor(0);
+
+    const dim = this.add.rectangle(0, 0, screenW * 2, screenH * 2, 0x000000, 0.65);
+    c.add(dim);
+
+    if (!winner) return c; // placeholder before game ends
+
+    const isWin = winner === "player";
+    const titleColor = isWin ? "#22c55e" : "#ef4444";
+    const titleStr = isWin ? "REGION CONQUERED!" : "DEFEATED";
+
+    const title = this.add.text(0, -50 * DPR, titleStr, {
+      fontSize: `${Math.round(40 * DPR)}px`,
+      color: titleColor,
+      fontFamily: "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
+      fontStyle: "bold",
+      stroke: "#000000",
+      strokeThickness: 5 * DPR,
+    }).setOrigin(0.5);
+    c.add(title);
+
+    const levelName = this.add.text(0, -10 * DPR, this.currentLevel.name, {
+      fontSize: `${Math.round(22 * DPR)}px`,
+      color: "#e5e7eb",
+      fontFamily: "'Segoe UI', Arial, sans-serif",
+      stroke: "#000",
+      strokeThickness: 3 * DPR,
+    }).setOrigin(0.5);
+    c.add(levelName);
+
+    // Buttons
+    if (isWin && this.currentLevelIndex < levels.length - 1) {
+      const nextBtn = this.add.text(0, 50 * DPR, "NEXT LEVEL >>", {
+        fontSize: `${Math.round(20 * DPR)}px`,
+        color: "#0f172a",
+        backgroundColor: "#22c55e",
+        fontFamily: "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
+        fontStyle: "bold",
+        padding: { x: 20 * DPR, y: 10 * DPR },
+      }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+      nextBtn.on("pointerdown", () => {
+        this.currentLevelIndex++;
+        this.scene.restart();
+      });
+      c.add(nextBtn);
+    } else if (isWin) {
+      const winMsg = this.add.text(0, 50 * DPR, "YOU CONQUERED AMERICA!", {
+        fontSize: `${Math.round(24 * DPR)}px`,
+        color: "#fbbf24",
+        fontFamily: "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
+        fontStyle: "bold",
+        stroke: "#000",
+        strokeThickness: 4 * DPR,
+      }).setOrigin(0.5);
+      c.add(winMsg);
+    }
+
+    if (!isWin) {
+      const retryBtn = this.add.text(0, 50 * DPR, "RETRY", {
+        fontSize: `${Math.round(20 * DPR)}px`,
+        color: "#0f172a",
+        backgroundColor: "#fbbf24",
+        fontFamily: "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
+        fontStyle: "bold",
+        padding: { x: 20 * DPR, y: 10 * DPR },
+      }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+      retryBtn.on("pointerdown", () => {
+        this.scene.restart();
+      });
+      c.add(retryBtn);
+    }
+
+    return c;
+  }
+
+  /** Show a hint about planes when on levels with aerial states. */
+  private showPlaneHintIfNeeded(): void {
+    const activeAerial = this.currentLevel.states.filter(id => AERIAL_STATES.has(id));
+    const playerAerial = activeAerial.filter(id =>
+      this.currentLevel.playerStart.includes(id));
+    if (playerAerial.length > 0) {
+      const names = playerAerial.join(", ");
+      this.time.delayedCall(3000, () => {
+        if (!this.levelComplete) {
+          this.addFeedEvent(
+            `TIP: Hold ${names} to open menu and build planes!`,
+            "player",
+          );
+        }
+      });
+    }
+  }
+
   // ── Rendering ──
 
   private redrawAll(): void {
     for (const [id, vis] of this.visuals) {
+      if (!this.gsm.activeStates.has(id)) continue;
       this.redrawState(id, vis);
     }
   }
 
   private redrawState(id: string, vis: StateVisual, hovered = false): void {
+    if (!this.gsm.state[id]) return; // not in current level
     const owner = this.gsm.getOwner(id);
     const units = this.gsm.getUnits(id);
     const wallLevel = this.gsm.getWallLevel(id);
@@ -818,8 +1013,8 @@ export class MapScene extends Phaser.Scene {
     this.stateWasHit = true; // prevent camera pan when tapping a state
     sound.unlock(); // user gesture unlocks audio context
 
-    // Block state interaction while paused
-    if (this.isPaused) return;
+    // Block state interaction while paused or level complete
+    if (this.isPaused || this.levelComplete) return;
 
     // Tapping a state always closes any open menu (long-press will reopen if held).
     this.closeStateMenu();
@@ -1484,6 +1679,7 @@ export class MapScene extends Phaser.Scene {
     let closestDist = Infinity;
 
     for (const [id, vis] of this.visuals) {
+      if (!this.gsm.activeStates.has(id)) continue;
       // Check polygon hit using Phaser's contains
       for (let i = 0; i < vis.gfxList.length; i++) {
         const polygon = vis.data.polygons[i];
@@ -1538,8 +1734,9 @@ export class MapScene extends Phaser.Scene {
     const pUnits = this.logicTick.countUnits("player");
     const aStates = this.logicTick.countStates("ai");
     const aUnits = this.logicTick.countUnits("ai");
+    const total = this.gsm.activeStates.size;
     this.statsText.setText(
-      `You: ${pStates} states, ${pUnits} units  |  AI: ${aStates} states, ${aUnits} units`
+      `You: ${pStates}/${total} states, ${pUnits} units  |  AI: ${aStates} states, ${aUnits} units`
     );
   }
 

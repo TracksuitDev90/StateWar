@@ -6,9 +6,10 @@ import { stateBonuses } from "../data/stateBonuses";
 const TICK_INTERVAL_MS = 1000;
 const BASE_GEN_PER_STATE = 0.15;
 const GEN_CAP = 99;
-const AI_TICK_INTERVAL = 5; // AI acts every 5 ticks (5 seconds) — slower, more balanced
+const AI_TICK_INTERVAL = 7; // AI acts every 7 ticks — deliberate pace
 
 export type TickCallback = () => void;
+export type VictoryCallback = (winner: Owner) => void;
 
 export class LogicTick {
   private gsm: GameStateManager;
@@ -16,7 +17,9 @@ export class LogicTick {
   private timerId: number | null = null;
   private accumulators: Record<string, number> = {};
   private onTick: TickCallback;
+  private onVictory: VictoryCallback | null = null;
   private tickCount = 0;
+  private victoryFired = false;
 
   constructor(gsm: GameStateManager, onTick: TickCallback) {
     this.gsm = gsm;
@@ -26,6 +29,10 @@ export class LogicTick {
     for (const id of Object.keys(gsm.state)) {
       this.accumulators[id] = 0;
     }
+  }
+
+  setVictoryCallback(cb: VictoryCallback): void {
+    this.onVictory = cb;
   }
 
   start(): void {
@@ -73,6 +80,16 @@ export class LogicTick {
     }
 
     this.onTick();
+
+    // Check for victory after state changes
+    if (!this.victoryFired && this.onVictory) {
+      const winner = this.gsm.checkVictory();
+      if (winner) {
+        this.victoryFired = true;
+        this.stop();
+        this.onVictory(winner);
+      }
+    }
   }
 
   getGenRate(stateId: string): number {

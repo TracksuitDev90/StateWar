@@ -3,6 +3,7 @@ import { stateData } from "../data/states";
 import { adjacencyGraph } from "../data/adjacency";
 import { stateDefenseBonus } from "../data/stateDefense";
 import { sound } from "../audio/SoundManager";
+import { LevelConfig } from "../data/levels";
 
 // States with aerial bombing capability.
 export const AERIAL_STATES = new Set(["CA", "TX", "FL", "WA", "IL", "NY"]);
@@ -17,11 +18,6 @@ export const PLANE_COST_UNITS = 20;   // units consumed to build a plane
 export const PLANE_BOMB_USES = 3;     // bombs per plane before it is lost
 const MAX_PLANES_PER_STATE = 1;
 
-const PLAYER_START = ["CA"];
-const AI_START = ["NY"];
-const STARTING_UNITS = 10;
-const NEUTRAL_UNITS = 5;
-
 // Wall constants
 const WALL_UNITS_PER_HEALTH = 1;  // 1 unit absorbed = 1 wall health
 const WALL_LEVEL1_MAX = 50;
@@ -35,6 +31,8 @@ for (const s of stateData) stateNameMap[s.id] = s.name;
 export class GameStateManager {
   public state: GameState = {};
   public planes: Plane[] = [];
+  /** The set of state IDs active in the current level. */
+  public activeStates: Set<string>;
   private nextPlaneId = 1;
   private moveListeners: MoveListener[] = [];
   private gameEventListeners: GameEventListener[] = [];
@@ -56,29 +54,48 @@ export class GameStateManager {
     for (const listener of this.gameEventListeners) listener(event);
   }
 
-  constructor() {
-    for (const s of stateData) {
-      let owner: Owner = "neutral";
-      let units = NEUTRAL_UNITS;
+  constructor(level: LevelConfig) {
+    this.activeStates = new Set(level.states);
 
-      if (PLAYER_START.includes(s.id)) {
+    for (const s of stateData) {
+      if (!this.activeStates.has(s.id)) continue;
+
+      let owner: Owner = "neutral";
+      let units = level.neutralUnits;
+
+      if (level.playerStart.includes(s.id)) {
         owner = "player";
-        units = STARTING_UNITS;
-      } else if (AI_START.includes(s.id)) {
+        units = level.startingUnits;
+      } else if (level.aiStart.includes(s.id)) {
         owner = "ai";
-        units = STARTING_UNITS;
+        units = level.startingUnits;
       }
 
       this.state[s.id] = { owner, units, wallHealth: 0, bombCooldown: 0 };
     }
   }
 
+  /** Check if one side has won the level (owns every active state). */
+  checkVictory(): Owner | null {
+    let allPlayer = true;
+    let allAi = true;
+    for (const id of this.activeStates) {
+      const t = this.state[id];
+      if (!t) continue;
+      if (t.owner !== "player") allPlayer = false;
+      if (t.owner !== "ai") allAi = false;
+    }
+    if (allPlayer) return "player";
+    if (allAi) return "ai";
+    return null;
+  }
+
   getOwner(stateId: string): Owner {
-    return this.state[stateId].owner;
+    return this.state[stateId]?.owner ?? "neutral";
   }
 
   getUnits(stateId: string): number {
-    return this.state[stateId].units;
+    return this.state[stateId]?.units ?? 0;
   }
 
   getDefenseBonus(stateId: string): number {
@@ -378,8 +395,9 @@ export class GameStateManager {
     };
   }
 
-  /** Check if fromId can attack toId — must be adjacent. */
+  /** Check if fromId can attack toId — must be adjacent and both in active level. */
   canAttack(fromId: string, toId: string): boolean {
+    if (!this.activeStates.has(fromId) || !this.activeStates.has(toId)) return false;
     const src = this.state[fromId];
     const dst = this.state[toId];
     if (!src || !dst) return false;
@@ -390,8 +408,9 @@ export class GameStateManager {
     return neighbors.includes(toId);
   }
 
-  /** Check if fromId can move units to toId (friendly) — any owned state to any owned state */
+  /** Check if fromId can move units to toId (friendly) — both must be in active level */
   canMove(fromId: string, toId: string): boolean {
+    if (!this.activeStates.has(fromId) || !this.activeStates.has(toId)) return false;
     const src = this.state[fromId];
     const dst = this.state[toId];
     if (!src || !dst) return false;
