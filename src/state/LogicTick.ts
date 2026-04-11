@@ -117,4 +117,8 @@ export class LogicTick {
   getRubberBandBonus(): number {
     return this.ai.rubberBandBonus;
   }
+
+  getTickCount(): number {
+    return this.tickCount;
+  }
 }

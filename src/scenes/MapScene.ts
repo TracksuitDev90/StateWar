@@ -7,6 +7,7 @@ import { Owner, CombatResult, UnitMoveEvent, GameEvent } from "../types";
 import { sound } from "../audio/SoundManager";
 import { AERIAL_STATES, PLANE_COST_UNITS } from "../state/GameStateManager";
 import { levels, LevelConfig } from "../data/levels";
+import { progressManager } from "../ui/ProgressManager";
 
 const DPR = Math.min(window.devicePixelRatio || 1, 2);
 const IS_MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
@@ -124,9 +125,24 @@ export class MapScene extends Phaser.Scene {
   private currentLevel!: LevelConfig;
   private victoryOverlay!: Phaser.GameObjects.Container;
   private levelComplete = false;
+  private conqueredStates: Set<string> = new Set();
 
   constructor() {
     super({ key: "MapScene" });
+  }
+
+  init(data: { levelIndex?: number } = {}): void {
+    if (typeof data.levelIndex === "number") {
+      this.currentLevelIndex = data.levelIndex;
+    }
+    this.levelComplete = false;
+    this.isPaused = false;
+    this.selectedStateId = null;
+    this.dragSourceId = null;
+    this.isDragging = false;
+    this.visuals.clear();
+    this.feedEvents = [];
+    this.stateMenu = null;
   }
 
   create(): void {
@@ -139,6 +155,18 @@ export class MapScene extends Phaser.Scene {
     this.currentLevel = levels[this.currentLevelIndex];
     this.levelComplete = false;
     this.gsm = new GameStateManager(this.currentLevel);
+
+    // Compute which states belong to previously-conquered regions (but are not
+    // part of this level). Shown as dim blue so the player sees their progress.
+    this.conqueredStates = new Set<string>();
+    for (let i = 0; i < levels.length - 1; i++) {
+      if (i === this.currentLevelIndex) continue;
+      if (progressManager.isCompleted(i)) {
+        for (const sid of levels[i].states) {
+          if (!this.gsm.activeStates.has(sid)) this.conqueredStates.add(sid);
+        }
+      }
+    }
 
     // Listen for AI/consolidation move events and animate them
     this.gsm.onMove((event: UnitMoveEvent) => {
@@ -182,15 +210,22 @@ export class MapScene extends Phaser.Scene {
           gfx.on("pointerout", () => this.onHover(state.id, false));
           gfx.on("pointerdown", (pointer: Phaser.Input.Pointer) => this.onPointerDownState(state.id, pointer));
         } else {
-          // Draw inactive states as dark outlines for map context
+          // Inactive states: show previously-conquered regions in dim blue,
+          // locked/future regions in dark gray. Whole-map visibility gives
+          // the game an iOS-style map-of-campaign feel.
           const scaled = scaledPolygon(polygon);
-          gfx.fillStyle(0x1a1a2e, 0.5);
+          const isConquered = this.conqueredStates.has(state.id);
+          const fillColor = isConquered ? 0x1e3a5f : 0x1a1a2e;
+          const fillAlpha = isConquered ? 0.75 : 0.55;
+          const strokeColor = isConquered ? 0x3b82f6 : 0x2d2d44;
+          const strokeAlpha = isConquered ? 0.6 : 0.4;
+          gfx.fillStyle(fillColor, fillAlpha);
           gfx.beginPath();
           gfx.moveTo(scaled[0][0], scaled[0][1]);
           for (let i = 1; i < scaled.length; i++) gfx.lineTo(scaled[i][0], scaled[i][1]);
           gfx.closePath();
           gfx.fillPath();
-          gfx.lineStyle(1 * DPR, 0x2d2d44, 0.4);
+          gfx.lineStyle(1 * DPR, strokeColor, strokeAlpha);
           gfx.beginPath();
           gfx.moveTo(scaled[0][0], scaled[0][1]);
           for (let i = 1; i < scaled.length; i++) gfx.lineTo(scaled[i][0], scaled[i][1]);
@@ -204,15 +239,16 @@ export class MapScene extends Phaser.Scene {
       const labelSize = Math.round(12 * DPR);
       const unitSize = Math.round(14 * DPR);
 
+      const showLabel = isActive || this.conqueredStates.has(state.id);
       const label = this.add.text(cx, cy - 8 * DPR, state.id, {
         fontSize: `${labelSize}px`,
-        color: "#f1f5f9",
+        color: isActive ? "#f1f5f9" : "#93c5fd",
         fontFamily: "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
         fontStyle: "bold",
         stroke: "#0f172a",
         strokeThickness: 3.5 * DPR,
         shadow: { offsetX: 0, offsetY: 1 * DPR, color: "#000", blur: 2 * DPR, fill: true, stroke: true },
-      }).setOrigin(0.5).setDepth(3).setVisible(isActive);
+      }).setOrigin(0.5).setDepth(3).setVisible(showLabel).setAlpha(isActive ? 1 : 0.5);
 
       const unitText = this.add.text(cx, cy + 7 * DPR, "", {
         fontSize: `${unitSize}px`,
@@ -237,8 +273,9 @@ export class MapScene extends Phaser.Scene {
       this.visuals.set(state.id, { data: state, gfxList, label, unitText, planeText, centroid });
     }
 
-    // ── Center camera on the active region ──
-    this.centerCameraOnRegion();
+    // ── Center camera on the active region (animated swoop-in) ──
+    this.centerCameraOnRegion(true);
+    this.cameras.main.fadeIn(400, 0, 0, 0);
 
     // Screen dimensions (actual game canvas size)
     const screenW = Number(this.game.config.width);
@@ -452,6 +489,55 @@ export class MapScene extends Phaser.Scene {
 
     // Show plane hint on levels that have aerial states
     this.showPlaneHintIfNeeded();
+
+    // Level intro banner — "Level X: Name" slides in from the top of the screen
+    this.showLevelIntro();
+  }
+
+  private showLevelIntro(): void {
+    const screenW = Number(this.game.config.width);
+    const screenH = Number(this.game.config.height);
+
+    const bg = this.add.rectangle(screenW / 2, screenH * 0.38, screenW, 120 * DPR, 0x0f172a, 0.85)
+      .setDepth(19).setScrollFactor(0).setAlpha(0);
+    const levelNum = this.add.text(screenW / 2, screenH * 0.38 - 20 * DPR,
+      `LEVEL ${this.currentLevel.id}`, {
+      fontSize: `${Math.round(16 * DPR)}px`,
+      color: "#fbbf24",
+      fontFamily: "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
+      fontStyle: "bold",
+      stroke: "#000",
+      strokeThickness: 3 * DPR,
+    }).setOrigin(0.5).setDepth(20).setScrollFactor(0).setAlpha(0);
+    const levelName = this.add.text(screenW / 2, screenH * 0.38 + 10 * DPR,
+      this.currentLevel.name, {
+      fontSize: `${Math.round(32 * DPR)}px`,
+      color: "#ffffff",
+      fontFamily: "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
+      fontStyle: "bold",
+      stroke: "#000",
+      strokeThickness: 4 * DPR,
+      shadow: { offsetX: 0, offsetY: 2 * DPR, color: "#000", blur: 8 * DPR, fill: true },
+    }).setOrigin(0.5).setDepth(20).setScrollFactor(0).setAlpha(0);
+
+    this.tweens.add({
+      targets: [bg, levelNum, levelName],
+      alpha: 1,
+      duration: 350,
+      ease: "Cubic.easeOut",
+    });
+    this.tweens.add({
+      targets: [bg, levelNum, levelName],
+      alpha: 0,
+      duration: 400,
+      delay: 1500,
+      ease: "Cubic.easeIn",
+      onComplete: () => {
+        bg.destroy();
+        levelNum.destroy();
+        levelName.destroy();
+      },
+    });
   }
 
   // ── Pause ──
@@ -479,31 +565,47 @@ export class MapScene extends Phaser.Scene {
     const cy = screenH / 2;
     const c = this.add.container(cx, cy).setDepth(20).setScrollFactor(0);
 
-    const dim = this.add.rectangle(0, 0, screenW * 2, screenH * 2, 0x000000, 0.55);
-    const title = this.add.text(0, -30 * DPR, "PAUSED", {
+    const dim = this.add.rectangle(0, 0, screenW * 2, screenH * 2, 0x000000, 0.6);
+    const title = this.add.text(0, -60 * DPR, "PAUSED", {
       fontSize: `${Math.round(48 * DPR)}px`,
       color: "#fbbf24",
-      fontFamily: "'Segoe UI', Arial, sans-serif",
+      fontFamily: "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
       fontStyle: "bold",
       stroke: "#000000",
       strokeThickness: 5 * DPR,
+      shadow: { offsetX: 0, offsetY: 3 * DPR, color: "#000", blur: 8 * DPR, fill: true },
     }).setOrigin(0.5);
-    const sub = this.add.text(0, 30 * DPR, IS_MOBILE ? "tap Start to resume" : "press [P] or click Start to resume", {
-      fontSize: `${Math.round(16 * DPR)}px`,
-      color: "#e5e7eb",
-      fontFamily: "'Segoe UI', Arial, sans-serif",
+    const sub = this.add.text(0, 0, IS_MOBILE ? "Tap Start to resume" : "Press [P] or click Start to resume", {
+      fontSize: `${Math.round(15 * DPR)}px`,
+      color: "#cbd5e1",
+      fontFamily: "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
       stroke: "#000000",
       strokeThickness: 3 * DPR,
     }).setOrigin(0.5);
 
-    c.add([dim, title, sub]);
+    const quitBtn = this.add.text(0, 60 * DPR, "Quit to Level Select", {
+      fontSize: `${Math.round(14 * DPR)}px`,
+      color: "#f1f5f9",
+      backgroundColor: "#334155",
+      fontFamily: "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
+      fontStyle: "bold",
+      padding: { x: 14 * DPR, y: 8 * DPR },
+    }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+    quitBtn.on("pointerdown", () => {
+      sound.uiTap();
+      this.logicTick.stop();
+      this.cameras.main.fadeOut(300, 0, 0, 0);
+      this.time.delayedCall(300, () => this.scene.start("LevelSelectScene"));
+    });
+
+    c.add([dim, title, sub, quitBtn]);
     return c;
   }
 
   // ── Level Progression ──
 
   /** Center the camera so all active states are nicely framed. */
-  private centerCameraOnRegion(): void {
+  private centerCameraOnRegion(animate = false): void {
     const activeSet = this.gsm.activeStates;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const id of activeSet) {
@@ -528,11 +630,27 @@ export class MapScene extends Phaser.Scene {
     const pad = 60 * DPR;
     const zoomX = screenW / (regionW + pad * 2);
     const zoomY = screenH / (regionH + pad * 2);
-    const zoom = Math.min(zoomX, zoomY, 2.5);
+    const targetZoom = Math.max(Math.min(zoomX, zoomY, 2.5), MOBILE_MIN_ZOOM);
 
     const cam = this.cameras.main;
-    cam.setZoom(Math.max(zoom, MOBILE_MIN_ZOOM));
-    cam.centerOn(cx, cy);
+    if (animate) {
+      // Start wide on the whole country, then swoop down to the region.
+      const startZoom = Math.max(targetZoom * 0.55, MOBILE_MIN_ZOOM * 0.75);
+      cam.setZoom(startZoom);
+      // Frame the whole contiguous US as the start point
+      cam.centerOn(640 * DPR, 360 * DPR);
+      this.tweens.add({
+        targets: cam,
+        zoom: targetZoom,
+        scrollX: cx - screenW / (2 * targetZoom),
+        scrollY: cy - screenH / (2 * targetZoom),
+        duration: 1000,
+        ease: "Cubic.easeOut",
+      });
+    } else {
+      cam.setZoom(targetZoom);
+      cam.centerOn(cx, cy);
+    }
   }
 
   /** Called when a side wins the level. */
@@ -542,23 +660,39 @@ export class MapScene extends Phaser.Scene {
     this.closeStateMenu();
     this.cancelLongPress();
 
+    // Compute star rating based on tick count vs. level size.
+    // 3★: under 15 ticks/state, 2★: under 30, else 1★.
+    let stars = 0;
+    if (winner === "player") {
+      const ticks = this.logicTick.getTickCount();
+      const stateCount = this.currentLevel.states.length;
+      if (ticks <= stateCount * 15) stars = 3;
+      else if (ticks <= stateCount * 30) stars = 2;
+      else stars = 1;
+
+      progressManager.completeLevel(this.currentLevelIndex, stars);
+      sound.levelComplete();
+    } else {
+      sound.levelFail();
+    }
+
     const screenW = Number(this.game.config.width);
     const screenH = Number(this.game.config.height);
 
     // Rebuild and show victory overlay with current result
     if (this.victoryOverlay) this.victoryOverlay.destroy(true);
-    this.victoryOverlay = this.buildVictoryOverlay(screenW, screenH, winner);
+    this.victoryOverlay = this.buildVictoryOverlay(screenW, screenH, winner, stars);
     this.victoryOverlay.setVisible(true);
   }
 
   private buildVictoryOverlay(
-    screenW: number, screenH: number, winner?: Owner,
+    screenW: number, screenH: number, winner?: Owner, stars = 0,
   ): Phaser.GameObjects.Container {
     const cx = screenW / 2;
     const cy = screenH / 2;
     const c = this.add.container(cx, cy).setDepth(25).setScrollFactor(0);
 
-    const dim = this.add.rectangle(0, 0, screenW * 2, screenH * 2, 0x000000, 0.65);
+    const dim = this.add.rectangle(0, 0, screenW * 2, screenH * 2, 0x000000, 0.72);
     c.add(dim);
 
     if (!winner) return c; // placeholder before game ends
@@ -567,68 +701,194 @@ export class MapScene extends Phaser.Scene {
     const titleColor = isWin ? "#22c55e" : "#ef4444";
     const titleStr = isWin ? "REGION CONQUERED!" : "DEFEATED";
 
-    const title = this.add.text(0, -50 * DPR, titleStr, {
-      fontSize: `${Math.round(40 * DPR)}px`,
+    // Confetti shower on victory
+    if (isWin) {
+      const palette = [0xfbbf24, 0x22c55e, 0x3b82f6, 0xec4899, 0x8b5cf6, 0xf97316];
+      for (let i = 0; i < 40; i++) {
+        const startX = (Math.random() - 0.5) * screenW;
+        const startY = -screenH / 2 - Math.random() * 40 * DPR;
+        const confColor = palette[Math.floor(Math.random() * palette.length)];
+        const confetti = this.add.rectangle(startX, startY, 6 * DPR, 10 * DPR, confColor)
+          .setAngle(Math.random() * 360);
+        c.add(confetti);
+        this.tweens.add({
+          targets: confetti,
+          y: screenH / 2 + 50 * DPR,
+          x: startX + (Math.random() - 0.5) * 100 * DPR,
+          angle: confetti.angle + 360 * (Math.random() > 0.5 ? 1 : -1),
+          duration: 1800 + Math.random() * 1500,
+          delay: Math.random() * 400,
+          ease: "Quad.easeIn",
+          onComplete: () => confetti.destroy(),
+        });
+      }
+    }
+
+    const title = this.add.text(0, -80 * DPR, titleStr, {
+      fontSize: `${Math.round(44 * DPR)}px`,
       color: titleColor,
       fontFamily: "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
       fontStyle: "bold",
       stroke: "#000000",
-      strokeThickness: 5 * DPR,
-    }).setOrigin(0.5);
+      strokeThickness: 6 * DPR,
+      shadow: { offsetX: 0, offsetY: 3 * DPR, color: "#000", blur: 8 * DPR, fill: true },
+    }).setOrigin(0.5).setScale(0.3);
     c.add(title);
+    this.tweens.add({
+      targets: title,
+      scale: 1,
+      duration: 520,
+      ease: "Back.easeOut",
+    });
 
-    const levelName = this.add.text(0, -10 * DPR, this.currentLevel.name, {
+    const levelName = this.add.text(0, -30 * DPR, this.currentLevel.name, {
       fontSize: `${Math.round(22 * DPR)}px`,
       color: "#e5e7eb",
-      fontFamily: "'Segoe UI', Arial, sans-serif",
+      fontFamily: "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
       stroke: "#000",
       strokeThickness: 3 * DPR,
-    }).setOrigin(0.5);
+    }).setOrigin(0.5).setAlpha(0);
     c.add(levelName);
+    this.tweens.add({
+      targets: levelName,
+      alpha: 1,
+      duration: 400,
+      delay: 300,
+    });
 
-    // Buttons
-    if (isWin && this.currentLevelIndex < levels.length - 1) {
-      const nextBtn = this.add.text(0, 50 * DPR, "NEXT LEVEL >>", {
-        fontSize: `${Math.round(20 * DPR)}px`,
-        color: "#0f172a",
-        backgroundColor: "#22c55e",
-        fontFamily: "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
-        fontStyle: "bold",
-        padding: { x: 20 * DPR, y: 10 * DPR },
-      }).setOrigin(0.5).setInteractive({ useHandCursor: true });
-      nextBtn.on("pointerdown", () => {
-        this.currentLevelIndex++;
-        this.scene.restart();
-      });
-      c.add(nextBtn);
-    } else if (isWin) {
-      const winMsg = this.add.text(0, 50 * DPR, "YOU CONQUERED AMERICA!", {
-        fontSize: `${Math.round(24 * DPR)}px`,
-        color: "#fbbf24",
-        fontFamily: "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
-        fontStyle: "bold",
-        stroke: "#000",
-        strokeThickness: 4 * DPR,
-      }).setOrigin(0.5);
-      c.add(winMsg);
+    // Star display on win
+    if (isWin) {
+      const starSpacing = 56 * DPR;
+      for (let i = 0; i < 3; i++) {
+        const earned = i < stars;
+        const star = this.add.text(
+          (i - 1) * starSpacing,
+          15 * DPR,
+          earned ? "\u2605" : "\u2606",
+          {
+            fontSize: `${Math.round(52 * DPR)}px`,
+            color: earned ? "#fbbf24" : "#475569",
+            fontFamily: "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
+            stroke: "#000000",
+            strokeThickness: 4 * DPR,
+          },
+        ).setOrigin(0.5).setScale(0);
+        c.add(star);
+        this.tweens.add({
+          targets: star,
+          scale: 1,
+          duration: 400,
+          delay: 600 + i * 200,
+          ease: "Back.easeOut",
+        });
+      }
     }
 
-    if (!isWin) {
-      const retryBtn = this.add.text(0, 50 * DPR, "RETRY", {
-        fontSize: `${Math.round(20 * DPR)}px`,
-        color: "#0f172a",
-        backgroundColor: "#fbbf24",
+    // Buttons
+    const btnY = 90 * DPR;
+    if (isWin) {
+      const isFinalLevel = this.currentLevelIndex >= levels.length - 1;
+      const label = isFinalLevel ? "VICTORY!" : "CONTINUE";
+      const continueBtn = this.makeOverlayButton(0, btnY, label, 220 * DPR, 54 * DPR, 0x22c55e, () => {
+        sound.uiTap();
+        this.cameras.main.fadeOut(350, 0, 0, 0);
+        this.time.delayedCall(350, () => this.scene.start("LevelSelectScene"));
+      });
+      c.add(continueBtn);
+
+      if (!isFinalLevel) {
+        const replayBtn = this.add.text(0, btnY + 50 * DPR, "Replay", {
+          fontSize: `${Math.round(14 * DPR)}px`,
+          color: "#94a3b8",
+          fontFamily: "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
+          fontStyle: "bold",
+        }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+        replayBtn.on("pointerdown", () => {
+          sound.uiTap();
+          this.cameras.main.fadeOut(300, 0, 0, 0);
+          this.time.delayedCall(300, () => this.scene.start("MapScene", { levelIndex: this.currentLevelIndex }));
+        });
+        c.add(replayBtn);
+      }
+    } else {
+      const retryBtn = this.makeOverlayButton(0, btnY, "RETRY", 200 * DPR, 54 * DPR, 0xfbbf24, () => {
+        sound.uiTap();
+        this.cameras.main.fadeOut(300, 0, 0, 0);
+        this.time.delayedCall(300, () => this.scene.start("MapScene", { levelIndex: this.currentLevelIndex }));
+      }, "#0f172a");
+      c.add(retryBtn);
+
+      const selectBtn = this.add.text(0, btnY + 50 * DPR, "Level Select", {
+        fontSize: `${Math.round(14 * DPR)}px`,
+        color: "#94a3b8",
         fontFamily: "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
         fontStyle: "bold",
-        padding: { x: 20 * DPR, y: 10 * DPR },
       }).setOrigin(0.5).setInteractive({ useHandCursor: true });
-      retryBtn.on("pointerdown", () => {
-        this.scene.restart();
+      selectBtn.on("pointerdown", () => {
+        sound.uiTap();
+        this.cameras.main.fadeOut(300, 0, 0, 0);
+        this.time.delayedCall(300, () => this.scene.start("LevelSelectScene"));
       });
-      c.add(retryBtn);
+      c.add(selectBtn);
     }
 
     return c;
+  }
+
+  /** iOS-style rounded button helper used by the victory overlay. */
+  private makeOverlayButton(
+    x: number, y: number, label: string,
+    w: number, h: number, color: number,
+    callback: () => void,
+    textColor = "#ffffff",
+  ): Phaser.GameObjects.Container {
+    const container = this.add.container(x, y);
+    const r = 14 * DPR;
+
+    const shadow = this.add.graphics();
+    shadow.fillStyle(0x000000, 0.35);
+    shadow.fillRoundedRect(-w / 2 + 2 * DPR, -h / 2 + 4 * DPR, w, h, r);
+
+    const body = this.add.graphics();
+    body.fillStyle(color, 1);
+    body.fillRoundedRect(-w / 2, -h / 2, w, h, r);
+    body.fillStyle(0xffffff, 0.12);
+    body.fillRoundedRect(-w / 2 + 2, -h / 2 + 2, w - 4, h * 0.4,
+      { tl: r, tr: r, bl: 4, br: 4 });
+
+    const text = this.add.text(0, 0, label, {
+      fontSize: `${Math.round(20 * DPR)}px`,
+      color: textColor,
+      fontFamily: "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
+      fontStyle: "bold",
+    }).setOrigin(0.5);
+
+    const hit = this.add.rectangle(0, 0, w, h, 0x000000, 0.001)
+      .setInteractive({ useHandCursor: true });
+    hit.on("pointerdown", () => {
+      container.setScale(0.96);
+    });
+    hit.on("pointerup", () => {
+      container.setScale(1);
+      callback();
+    });
+    hit.on("pointerout", () => {
+      container.setScale(1);
+    });
+
+    container.add([shadow, body, text, hit]);
+
+    // Gentle pulse to draw the eye
+    this.tweens.add({
+      targets: container,
+      scaleX: 1.04, scaleY: 1.04,
+      duration: 900,
+      yoyo: true,
+      repeat: -1,
+      ease: "Sine.easeInOut",
+    });
+
+    return container;
   }
 
   /** Show a hint about planes when on levels with aerial states. */

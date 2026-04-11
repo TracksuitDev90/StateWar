@@ -1,5 +1,7 @@
 import Phaser from "phaser";
 import { MapScene } from "./scenes/MapScene";
+import { TitleScene } from "./scenes/TitleScene";
+import { LevelSelectScene } from "./scenes/LevelSelectScene";
 
 const dpr = Math.min(window.devicePixelRatio || 1, 2);
 
@@ -18,7 +20,7 @@ const config: Phaser.Types.Core.GameConfig = {
   height: gameH,
   backgroundColor: "#1a1a2e",
   parent: document.body,
-  scene: [MapScene],
+  scene: [TitleScene, LevelSelectScene, MapScene],
   scale: {
     mode: Phaser.Scale.FIT,
     autoCenter: Phaser.Scale.CENTER_BOTH,
