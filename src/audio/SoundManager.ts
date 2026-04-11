@@ -112,6 +112,22 @@ class SoundManager {
     this.noise(0.4, 0.35, 0.32);
     this.tone(80, 0.35, "sawtooth", 0.22, 40, 0.32);
   }
+
+  uiTap(): void {
+    this.tone(800, 0.04, "sine", 0.08);
+  }
+
+  levelComplete(): void {
+    this.tone(523, 0.12, "sine", 0.2);
+    this.tone(659, 0.12, "sine", 0.2, null, 0.1);
+    this.tone(784, 0.12, "sine", 0.2, null, 0.2);
+    this.tone(1047, 0.25, "sine", 0.25, null, 0.3);
+  }
+
+  levelFail(): void {
+    this.tone(400, 0.2, "sawtooth", 0.15, 200);
+    this.tone(300, 0.3, "sawtooth", 0.12, 150, 0.15);
+  }
 }
 
 export const sound = new SoundManager();
